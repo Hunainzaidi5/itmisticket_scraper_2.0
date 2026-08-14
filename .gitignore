@@ -1,0 +1,174 @@
+# ============================================================
+# ITMIS Ticket Scraper 2.0 - Git Ignore
+# ============================================================
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Python packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# ------------------------------------------------------------
+# IDE / Editor
+# ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# ------------------------------------------------------------
+# Operating System
+# ------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100
+.Trashes
+
+# ------------------------------------------------------------
+# Application Logs
+# ------------------------------------------------------------
+*.log
+debug_log_*.txt
+debug_*.txt
+
+# Keep the project's intentional output.txt if it is a
+# source/documentation file.
+# output.txt
+
+# ------------------------------------------------------------
+# ITMIS Generated Results
+# ------------------------------------------------------------
+rechecked.xlsx
+rechecked_*.xlsx
+rechecked_backup_*.xlsx
+
+summary_*.json
+
+# ------------------------------------------------------------
+# Temporary / Exported Data
+# ------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.backup
+*.cache
+
+# Temporary Excel lock files
+~$*.xlsx
+~$*.xls
+~$*.xlsm
+
+# ------------------------------------------------------------
+# Local Configuration / Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+*.secret
+*.secrets
+secrets/
+credentials/
+credentials.json
+
+# Local configuration files
+config.local.*
+settings.local.*
+
+# ------------------------------------------------------------
+# Selenium / Chrome
+# ------------------------------------------------------------
+chrome_profile/
+chrome-data/
+selenium/
+selenium_cache/
+webdriver_cache/
+
+# Chrome crash/debug files
+chrome_debug.log
+chromedriver.log
+
+# ------------------------------------------------------------
+# PyInstaller
+# ------------------------------------------------------------
+*.manifest.bak
+*.spec.bak
+
+# PyInstaller work directories
+# Keep ticket_scraper.spec tracked.
+# build/ and dist/ are already ignored above.
+
+# ------------------------------------------------------------
+# Generated Executables
+# ------------------------------------------------------------
+*.exe
+
+# ------------------------------------------------------------
+# Generated Installer / Archive Files
+# ------------------------------------------------------------
+*.msi
+*.zip
+*.7z
+*.rar
+
+# ------------------------------------------------------------
+# Local Development Files
+# ------------------------------------------------------------
+local/
+temp/
+tmp/
+
+# ------------------------------------------------------------
+# Sensitive ITMIS Data
+# ------------------------------------------------------------
+# Add any locally exported operational datasets here.
+tickets/
+ticket_data/
+exports/
+reports/
+
+# ------------------------------------------------------------
+# OS / Tool Temporary Files
+# ------------------------------------------------------------
+*.pid
+*.pid.lock
+*.orig
+*.rej

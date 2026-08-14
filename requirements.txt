@@ -1,0 +1,7 @@
+PyQt6
+pandas
+selenium
+webdriver-manager
+psutil
+Pillow
+pyinstaller
