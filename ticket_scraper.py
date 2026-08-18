@@ -1433,14 +1433,22 @@ class LiveMonitorThread(QThread):
         # so a row that appears in ITMIS is surfaced almost immediately.
         self._dashboard_refresh_interval = 0.20
 
-        # The ITMIS Angular dashboard can keep showing the same DOM row long after
-        # the ticket has been created on the server. Merely reading that stale DOM
-        # 5x/second cannot reveal data Angular has not fetched yet. To keep the
-        # dashboard itself fresh, actively reload ONLY the dedicated dashboard tab
-        # every ~2 seconds once it is fully loaded. The 200 ms DOM watcher still
-        # runs between refreshes, so a row that arrives naturally is caught at once.
-        self._dashboard_force_refresh_interval = 2.0
-        self._last_dashboard_force_refresh_time = 0.0
+        # Silent server-side ticket feed.  The visible dashboard is NEVER reloaded.
+        # Chrome performance events are used once to identify the same XHR/fetch
+        # request Angular uses for dashboard tickets.  That request is then repeated
+        # inside the logged-in page with fetch(), so fresh server data can be seen
+        # before Angular decides to repaint its table.
+        self._silent_api_request = None
+        self._silent_api_installed = False
+        self._silent_api_discovery_attempts = 0
+        self._silent_api_last_discovery_time = 0.0
+        self._silent_api_discovery_interval = 1.0
+        self._silent_api_poll_interval = 0.50
+        self._silent_api_last_state_check = 0.0
+        self._silent_api_state_check_interval = 0.20
+        self._silent_api_last_seq = -1
+        self._silent_api_baseline_initialized = False
+        self._silent_api_baseline_ids = set()
 
         # Keep secondary work slightly slower so it cannot starve the dashboard watcher.
         self._notification_poll_interval = 0.50
@@ -1491,9 +1499,8 @@ class LiveMonitorThread(QThread):
                 "Baseline established — existing tickets are ignored; "
                 "only post-start tickets will be captured."
             )
-            self._last_dashboard_force_refresh_time = time.time()
             self.status_update.emit(
-                "Logged in — active-refresh patrol (200 ms scan + dashboard data refresh about every 2 seconds)"
+                "Logged in — silent ultra-fast patrol (200 ms DOM scan + background ticket API polling; no page reload)"
             )
             self._patrol_loop()
         except Exception as e:
@@ -1520,6 +1527,9 @@ class LiveMonitorThread(QThread):
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
+        # Capture Network.request/response events so the monitor can discover the
+        # dashboard's ticket XHR once, then poll it silently without refreshing UI.
+        chrome_options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         if self.config.HEADLESS_MODE:
             chrome_options.add_argument("--headless=new")
         if os.path.exists(self.config.CHROME_BINARY_PATH):
@@ -1529,6 +1539,10 @@ class LiveMonitorThread(QThread):
     def _try_launch_driver(self, service, chrome_options):
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.driver.set_page_load_timeout(self.config.PAGE_LOAD_TIMEOUT)
+        try:
+            self.driver.execute_cdp_cmd("Network.enable", {})
+        except Exception:
+            pass
         self.driver.execute_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -2468,48 +2482,396 @@ class LiveMonitorThread(QThread):
             self.status_update.emit(f"Scan dashboard rows error: {e}")
             return [], {}
 
-    def _force_dashboard_data_refresh(self):
-        """Force the dedicated dashboard tab to fetch fresh ITMIS data.
+    def _normalize_api_ticket_ids(self, body_text):
+        """Return normalized full ticket IDs found anywhere in an API response."""
+        text = str(body_text or "")
+        ids = []
+        seen = set()
 
-        The 200 ms scanner only observes what Angular has already rendered. In
-        real runs the row can remain unchanged for tens of seconds even though a
-        ticket's own timestamp is newer. A CDP Page.reload on the dashboard tab
-        is asynchronous and avoids blocking on a full Selenium ``driver.refresh``.
-        It is intentionally isolated to the dashboard handle so detail tabs are
-        never disturbed.
+        # Prefer the prefix already proven by the dashboard baseline.
+        prefix = "LHR.L2SP"
+        for existing in (self._last_known_dashboard_tickets or list(self._baseline_ticket_ids)):
+            if TICKET_REGEX.match(str(existing or "")):
+                parts = str(existing).upper().split(".")
+                if len(parts) >= 2:
+                    prefix = ".".join(parts[:2])
+                    break
+
+        # Full IDs, when present.
+        full_re = re.compile(
+            r'\b[A-Z]{2,5}\.[A-Z0-9]{2,8}\.\d{4}\.\d{2}\.\d{6,10}\b',
+            re.IGNORECASE,
+        )
+        for match in full_re.findall(text):
+            ticket_id = str(match).upper()
+            if ticket_id not in seen and TICKET_REGEX.match(ticket_id):
+                seen.add(ticket_id)
+                ids.append(ticket_id)
+
+        # Many APIs return only the numeric/year portion used by the dashboard.
+        for partial in TICKET_REGEX_PARTIAL.findall(text):
+            ticket_id = f"{prefix}.{str(partial).upper()}"
+            if ticket_id not in seen and TICKET_REGEX.match(ticket_id):
+                seen.add(ticket_id)
+                ids.append(ticket_id)
+
+        return ids
+
+    def _extract_api_details(self, body_text, ticket_number):
+        """Best-effort details from the JSON object containing a ticket ID."""
+        details = {
+            "assignee": "Unknown",
+            "station": "Unknown station",
+            "description": "Server ticket detected — details loading",
+            "priority": "Unknown",
+            "date": "Server time pending",
+        }
+        try:
+            data = json.loads(str(body_text or ""))
+        except Exception:
+            return details
+
+        partial = ".".join(str(ticket_number).split(".")[-3:]).lower()
+        full = str(ticket_number).lower()
+        target = None
+
+        def walk(node):
+            nonlocal target
+            if target is not None:
+                return
+            if isinstance(node, dict):
+                try:
+                    blob = json.dumps(node, ensure_ascii=False, default=str).lower()
+                except Exception:
+                    blob = str(node).lower()
+                if full in blob or partial in blob:
+                    target = node
+                    return
+                for value in node.values():
+                    walk(value)
+                    if target is not None:
+                        return
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+                    if target is not None:
+                        return
+
+        walk(data)
+        if not isinstance(target, dict):
+            return details
+
+        def pick(key_words, default):
+            # Exact-ish keys first, then substring keys. Ignore nested collections.
+            lowered = {str(k).lower(): v for k, v in target.items()}
+            for wanted in key_words:
+                for key, value in lowered.items():
+                    if key == wanted and value not in (None, "", [], {}):
+                        if not isinstance(value, (dict, list)):
+                            return str(value).strip()
+            for wanted in key_words:
+                for key, value in lowered.items():
+                    if wanted in key and value not in (None, "", [], {}):
+                        if not isinstance(value, (dict, list)):
+                            return str(value).strip()
+            return default
+
+        details["station"] = pick(
+            ["station", "stationname", "location", "locationname"],
+            details["station"],
+        )
+        details["description"] = pick(
+            ["description", "faultdescription", "complaint", "subject", "title"],
+            details["description"],
+        )
+        details["priority"] = pick(
+            ["priority", "priorityname", "severity"], details["priority"]
+        )
+        details["assignee"] = pick(
+            ["assignee", "assignedto", "assignedtoname", "technician"],
+            details["assignee"],
+        )
+        details["date"] = pick(
+            ["createddate", "createdon", "createdat", "ticketdate", "datetime", "date"],
+            details["date"],
+        )
+        return details
+
+    def _discover_silent_ticket_api(self):
+        """Identify the dashboard ticket XHR/fetch from Chrome performance events.
+
+        Discovery is read-only: it does not navigate, reload, click, or switch the
+        user's page to another URL.  A response is accepted only when its body
+        contains one of the already-known dashboard baseline ticket IDs, which
+        sharply reduces the chance of selecting an unrelated API endpoint.
         """
+        now = time.time()
+        if self._silent_api_request or (
+            now - self._silent_api_last_discovery_time < self._silent_api_discovery_interval
+        ):
+            return bool(self._silent_api_request)
+        self._silent_api_last_discovery_time = now
+        self._silent_api_discovery_attempts += 1
+
+        try:
+            with self._driver_lock:
+                try:
+                    entries = self.driver.get_log("performance") or []
+                except Exception as e:
+                    if self._silent_api_discovery_attempts <= 2:
+                        self.status_update.emit(f"Silent API discovery unavailable: {e}")
+                    return False
+
+                requests = {}
+                responses = []
+                for entry in entries:
+                    try:
+                        msg = json.loads(entry.get("message", "{}"))["message"]
+                        method = msg.get("method")
+                        params = msg.get("params", {})
+                        request_id = params.get("requestId")
+                        if method == "Network.requestWillBeSent" and request_id:
+                            req = params.get("request", {}) or {}
+                            requests[request_id] = {
+                                "url": str(req.get("url", "")),
+                                "method": str(req.get("method", "GET") or "GET").upper(),
+                                "headers": req.get("headers", {}) or {},
+                                "postData": req.get("postData"),
+                            }
+                        elif method == "Network.responseReceived" and request_id:
+                            resp = params.get("response", {}) or {}
+                            resource_type = str(params.get("type", ""))
+                            if resource_type in {"XHR", "Fetch"}:
+                                responses.append((request_id, str(resp.get("url", ""))))
+                    except Exception:
+                        continue
+
+                baseline_ids = [
+                    str(t).upper() for t in self._baseline_ticket_ids
+                    if TICKET_REGEX.match(str(t or ""))
+                ]
+                baseline_needles = set()
+                for tid in baseline_ids:
+                    baseline_needles.add(tid.lower())
+                    baseline_needles.add(".".join(tid.split(".")[-3:]).lower())
+
+                # Newest responses first; the initial dashboard data call is often
+                # near the end of the performance stream.
+                for request_id, response_url in reversed(responses):
+                    req = requests.get(request_id, {})
+                    url = req.get("url") or response_url
+                    if not url or "itmis.olmrts.com.pk" not in url.lower():
+                        continue
+                    lowered_url = url.lower()
+                    if any(x in lowered_url for x in (".js", ".css", ".png", ".jpg", ".svg", "favicon")):
+                        continue
+                    try:
+                        payload = self.driver.execute_cdp_cmd(
+                            "Network.getResponseBody", {"requestId": request_id}
+                        ) or {}
+                        body = str(payload.get("body", "") or "")
+                    except Exception:
+                        continue
+                    if not body:
+                        continue
+
+                    low_body = body.lower()
+                    found_ids = self._normalize_api_ticket_ids(body)
+                    baseline_hit = any(n in low_body for n in baseline_needles)
+                    if not baseline_hit or len(found_ids) < 2:
+                        continue
+
+                    # Keep only headers browser fetch is allowed to set and which
+                    # may actually be needed by the authenticated API request.
+                    safe_headers = {}
+                    for key, value in (req.get("headers") or {}).items():
+                        lk = str(key).lower()
+                        if lk in {"authorization", "content-type", "accept"} or lk.startswith("x-"):
+                            safe_headers[str(key)] = str(value)
+
+                    self._silent_api_request = {
+                        "url": url,
+                        "method": str(req.get("method") or "GET").upper(),
+                        "headers": safe_headers,
+                        "postData": req.get("postData"),
+                    }
+                    self.status_update.emit(
+                        "Silent ticket API discovered — switching to background server polling; visible page will not refresh."
+                    )
+                    return True
+
+        except Exception as e:
+            if self._silent_api_discovery_attempts <= 3:
+                self.status_update.emit(f"Silent API discovery error: {e}")
+        return False
+
+    def _install_silent_api_poller(self):
+        """Install an invisible browser-side fetch loop for the discovered API."""
+        if self._silent_api_installed or not self._silent_api_request:
+            return self._silent_api_installed
+        req = self._silent_api_request
         try:
             with self._driver_lock:
                 handles = list(self.driver.window_handles)
                 if not handles or self._dashboard_handle not in handles:
                     return False
-
-                try:
-                    original_handle = self.driver.current_window_handle
-                except Exception:
-                    original_handle = handles[0]
-
+                original_handle = self.driver.current_window_handle
                 self.driver.switch_to.window(self._dashboard_handle)
+                result = self.driver.execute_script(
+                    r"""
+                    const cfg = arguments[0];
+                    const intervalMs = arguments[1];
+                    try {
+                        if (window.__itmisSilentTicketPoller && window.__itmisSilentTicketPoller.timer) {
+                            clearInterval(window.__itmisSilentTicketPoller.timer);
+                        }
+                    } catch (e) {}
 
-                # CDP reload is faster/non-blocking compared with driver.refresh().
-                # ignoreCache helps avoid a stale dashboard shell/API bootstrap.
-                try:
-                    self.driver.execute_cdp_cmd("Page.reload", {"ignoreCache": True})
-                except Exception:
-                    # Fallback if the Chrome/driver build rejects Page.reload.
-                    self.driver.execute_script("window.location.reload();")
+                    const state = {
+                        seq: 0,
+                        body: '',
+                        at: 0,
+                        error: '',
+                        busy: false,
+                        timer: null
+                    };
+                    window.__itmisSilentTicketPoller = state;
 
+                    const poll = async () => {
+                        if (state.busy) return;
+                        state.busy = true;
+                        try {
+                            const opts = {
+                                method: cfg.method || 'GET',
+                                credentials: 'include',
+                                cache: 'no-store',
+                                headers: cfg.headers || {}
+                            };
+                            if (cfg.postData != null && String(cfg.method || 'GET').toUpperCase() !== 'GET') {
+                                opts.body = cfg.postData;
+                            }
+                            const resp = await fetch(cfg.url, opts);
+                            const text = await resp.text();
+                            if (resp.ok) {
+                                state.body = text;
+                                state.at = Date.now();
+                                state.error = '';
+                                state.seq += 1;
+                            } else {
+                                state.error = 'HTTP ' + resp.status;
+                            }
+                        } catch (e) {
+                            state.error = String(e && e.message ? e.message : e);
+                        } finally {
+                            state.busy = false;
+                        }
+                    };
+                    poll();
+                    state.timer = setInterval(poll, intervalMs);
+                    return true;
+                    """,
+                    req,
+                    int(self._silent_api_poll_interval * 1000),
+                )
                 if original_handle in self.driver.window_handles:
                     self.driver.switch_to.window(original_handle)
-
-            self.status_update.emit(
-                f"Forced dashboard data refresh at "
-                f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
-            )
-            return True
+            self._silent_api_installed = bool(result)
+            if self._silent_api_installed:
+                self.status_update.emit(
+                    f"Silent ticket API poller active every {int(self._silent_api_poll_interval * 1000)} ms — no visible dashboard reload."
+                )
+            return self._silent_api_installed
         except Exception as e:
-            self.status_update.emit(f"Dashboard force-refresh error: {e}")
+            self.status_update.emit(f"Silent API poller install error: {e}")
             return False
+
+    def _poll_silent_ticket_api(self):
+        """Read the latest invisible API snapshot and capture newly appearing IDs."""
+        now = time.time()
+        if now - self._silent_api_last_state_check < self._silent_api_state_check_interval:
+            return
+        self._silent_api_last_state_check = now
+
+        if not self._silent_api_request:
+            self._discover_silent_ticket_api()
+        if self._silent_api_request and not self._silent_api_installed:
+            self._install_silent_api_poller()
+        if not self._silent_api_installed:
+            return
+
+        try:
+            with self._driver_lock:
+                handles = list(self.driver.window_handles)
+                if not handles or self._dashboard_handle not in handles:
+                    self._silent_api_installed = False
+                    return
+                original_handle = self.driver.current_window_handle
+                self.driver.switch_to.window(self._dashboard_handle)
+                state = self.driver.execute_script(
+                    """
+                    const s = window.__itmisSilentTicketPoller;
+                    if (!s) return null;
+                    return {seq:s.seq || 0, body:s.body || '', at:s.at || 0, error:s.error || ''};
+                    """
+                )
+                if original_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(original_handle)
+        except Exception as e:
+            self.status_update.emit(f"Silent API state read error: {e}")
+            self._silent_api_installed = False
+            return
+
+        if not state:
+            self._silent_api_installed = False
+            return
+        seq = int(state.get("seq", 0) or 0)
+        if seq <= self._silent_api_last_seq:
+            return
+        self._silent_api_last_seq = seq
+        body = str(state.get("body", "") or "")
+        if not body:
+            return
+
+        ids = self._normalize_api_ticket_ids(body)
+        if not ids:
+            return
+
+        if not self._silent_api_baseline_initialized:
+            self._silent_api_baseline_ids.update(ids)
+            self._silent_api_baseline_ids.update(self._baseline_ticket_ids)
+            self._silent_api_baseline_initialized = True
+            self.status_update.emit(
+                f"Silent API baseline recorded: {len(ids)} ticket ID(s); future server-side arrivals will be captured immediately."
+            )
+            return
+
+        new_ids = [
+            tid for tid in ids
+            if tid not in self._silent_api_baseline_ids
+            and tid not in self._baseline_ticket_ids
+            and tid not in self._processed_ids
+        ]
+        if not new_ids:
+            return
+
+        detected = datetime.now()
+        self.status_update.emit(
+            f"Silent API detected {len(new_ids)} new ticket(s) at "
+            f"{detected.strftime('%H:%M:%S.%f')[:-3]}: {new_ids}"
+        )
+        for ticket_number in new_ids:
+            # Add immediately to the API baseline so repeated snapshots cannot emit
+            # a second alert while full-detail extraction is starting.
+            self._silent_api_baseline_ids.add(ticket_number)
+            ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
+            details = self._extract_api_details(body, ticket_number)
+            self._emit_immediate_dashboard_record(ticket_number, ticket_url, details)
+            self.status_update.emit(
+                f"Opening full details in background: {ticket_number} (Silent API)"
+            )
+            self._capture_ticket_via_new_tab(
+                ticket_number, ticket_url, source_label="Silent API"
+            )
 
     def _get_notification_count(self):
         """Get the current notification count from the bell icon."""
@@ -2790,9 +3152,14 @@ class LiveMonitorThread(QThread):
         try:
             current_time = time.time()
 
-            # ----- Dashboard: highest priority path -----
-            # This runs before notification-bell work so a visible row is not delayed
-            # by other Selenium calls.
+            # ----- Silent API: highest priority path -----
+            # Reads the browser-side fetch poller. It can surface a server-side ticket
+            # before Angular updates the visible dashboard table, without any reload.
+            self._poll_silent_ticket_api()
+
+            # ----- Dashboard DOM: secondary confirmation/fallback -----
+            # The existing 200 ms scan remains in place in case API discovery is not
+            # available in a particular ITMIS build/session.
             if current_time - self._last_dashboard_refresh_time >= self._dashboard_refresh_interval:
                 self._last_dashboard_refresh_time = current_time
 
@@ -2853,25 +3220,8 @@ class LiveMonitorThread(QThread):
 
                     self._last_known_dashboard_tickets = list(current_dashboard_tickets)
 
-                # IMPORTANT: scanning the DOM faster does not make Angular fetch
-                # fresh data faster. If this scan is still showing a real table
-                # (not its Loading tickets placeholder), periodically refresh the
-                # dedicated dashboard tab so ITMIS re-requests its current ticket
-                # list. While a reload is in progress, push the next refresh out
-                # instead of reloading the page repeatedly before it can settle.
-                if self._last_dashboard_scan_was_loading:
-                    self._last_dashboard_force_refresh_time = current_time
-                elif (
-                    current_time - self._last_dashboard_force_refresh_time
-                    >= self._dashboard_force_refresh_interval
-                ):
-                    if self._force_dashboard_data_refresh():
-                        self._last_dashboard_force_refresh_time = time.time()
-                    else:
-                        # Retry soon, but not on every 50 ms scheduler tick.
-                        self._last_dashboard_force_refresh_time = current_time - (
-                            self._dashboard_force_refresh_interval - 0.5
-                        )
+                # No visible refresh is performed here. Fresh server data is handled
+                # by the silent API poller; this DOM scan is confirmation/fallback only.
 
             # ----- Notification bell: secondary path -----
             # Polling it less often prevents its Selenium lookup from slowing the
@@ -3642,7 +3992,7 @@ class MainWindow(QMainWindow):
 
         
     def init_ui(self):
-        self.setWindowTitle("ITMIS Ticket Scraper")
+        self.setWindowTitle("ITMIS Ticket Scraper v2.0")
         self.setMinimumSize(1000, 780)
         self.resize(1120, 960)
 
