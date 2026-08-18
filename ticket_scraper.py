@@ -13,7 +13,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QFileDialog, QTextEdit, QFrame, QSplitter, QSpinBox,
                            QCheckBox, QGroupBox, QGridLayout, QLineEdit, QComboBox,
                            QMessageBox, QTabWidget, QFormLayout, QToolBar,
-                           QGraphicsDropShadowEffect, QScrollArea)
+                           QGraphicsDropShadowEffect, QScrollArea, QSystemTrayIcon,
+                           QToolButton, QSizeGrip)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QSize, QTimer, QEvent, QObject
 from PyQt6.QtGui import (QFont, QTextCursor, QIcon, QShortcut, QKeySequence, QAction,
                           QPalette, QColor, QPixmap, QPainter, QImage)
@@ -1402,7 +1403,7 @@ class LiveMonitorThread(QThread):
     monitoring_stopped = pyqtSignal()
     monitor_stats = pyqtSignal(int, int)  # open tab count, tickets captured
 
-    def __init__(self, config):
+    def __init__(self, config, session_start=None):
         super().__init__()
         self.config = config
         self.driver = None
@@ -1420,13 +1421,47 @@ class LiveMonitorThread(QThread):
         self.captured_tickets = []
         self._target_handle_map = {}
         self._last_handle_count = 0
-        self._last_notification_count = 0
+
+        # Live-monitor baseline state. None means the notification baseline has
+        # not been established yet; using 0 here would make all existing unread
+        # notifications look new on startup.
+        self._last_notification_count = None
         self._last_dashboard_ticket_count = 0
         self._dashboard_monitoring_enabled = True
         self._last_dashboard_refresh_time = 0
-        self._dashboard_refresh_interval = 10  # 10 seconds
-        self._last_known_dashboard_tickets = []  # Track last known tickets from dashboard
-        self.pending_reextract = []  # [(ticket_id, ticket_url), ...] restored preliminary records to upgrade on startup
+        # Ultra-fast dashboard patrol.  The dashboard DOM is sampled every ~200 ms
+        # so a row that appears in ITMIS is surfaced almost immediately.
+        self._dashboard_refresh_interval = 0.20
+
+        # The ITMIS Angular dashboard can keep showing the same DOM row long after
+        # the ticket has been created on the server. Merely reading that stale DOM
+        # 5x/second cannot reveal data Angular has not fetched yet. To keep the
+        # dashboard itself fresh, actively reload ONLY the dedicated dashboard tab
+        # every ~2 seconds once it is fully loaded. The 200 ms DOM watcher still
+        # runs between refreshes, so a row that arrives naturally is caught at once.
+        self._dashboard_force_refresh_interval = 2.0
+        self._last_dashboard_force_refresh_time = 0.0
+
+        # Keep secondary work slightly slower so it cannot starve the dashboard watcher.
+        self._notification_poll_interval = 0.50
+        self._last_notification_poll_time = 0.0
+        self._tab_scan_interval = 0.50
+        self._last_tab_scan_time = 0.0
+        self._dashboard_handle = None
+        self._last_known_dashboard_tickets = []
+        self._dashboard_baseline_initialized = False
+        self._baseline_ticket_ids = set()
+        self._last_dashboard_scan_was_loading = False
+
+        # The UI records when Start was pressed. The stricter capture cutoff is
+        # set after login + baseline initialization, because monitoring cannot
+        # safely distinguish new/old tickets until that snapshot is complete.
+        self.session_start = session_start or datetime.now()
+        self._monitoring_cutoff = None
+
+        # Kept for backwards compatibility with restored session data, but old
+        # preliminary records are no longer automatically re-fetched on startup.
+        self.pending_reextract = []
 
     def stop(self):
         self._stop_event.set()
@@ -1447,14 +1482,19 @@ class LiveMonitorThread(QThread):
                     self.error_occurred.emit("Login timeout — URL did not leave the login page.")
                 return
 
-            if self.pending_reextract and not self._stop_event.is_set():
-                self.status_update.emit(
-                    f"Re-extracting {len(self.pending_reextract)} restored ticket(s) that were "
-                    "missing full page details..."
-                )
-                self._reextract_pending()
+            self.status_update.emit("Login successful — establishing monitoring baseline...")
+            self._initialize_monitoring_baseline()
+            if self._stop_event.is_set():
+                return
 
-            self.status_update.emit("Logged in — patrol mode active (polling every 500ms)")
+            self.status_update.emit(
+                "Baseline established — existing tickets are ignored; "
+                "only post-start tickets will be captured."
+            )
+            self._last_dashboard_force_refresh_time = time.time()
+            self.status_update.emit(
+                "Logged in — active-refresh patrol (200 ms scan + dashboard data refresh about every 2 seconds)"
+            )
             self._patrol_loop()
         except Exception as e:
             if not self._stop_event.is_set():
@@ -1594,13 +1634,142 @@ class LiveMonitorThread(QThread):
             self.driver.switch_to.window(original)
         return mapping
 
+    def _initialize_monitoring_baseline(self):
+        """Snapshot existing ITMIS state so old tickets are never treated as new."""
+        # Notification count baseline: existing unread notifications are not new.
+        self._last_notification_count = self._get_notification_count()
+        self.status_update.emit(
+            f"Notification baseline recorded: {self._last_notification_count} existing notification(s)."
+        )
+
+        # Dashboard baseline: wait until Angular has finished replacing the
+        # temporary "Loading tickets..." row with the real dashboard rows.  The
+        # previous implementation accepted that placeholder as an empty baseline,
+        # which made all 15 existing rows look new a moment later and opened every
+        # one of them for verification.
+        try:
+            current_tickets, dashboard_ready = self._wait_for_stable_dashboard_baseline(
+                max_rows=15, timeout=12.0
+            )
+        except Exception as e:
+            self.status_update.emit(f"Dashboard baseline warning: {e}")
+            current_tickets, dashboard_ready = [], False
+
+        self._last_known_dashboard_tickets = list(current_tickets or [])
+        self._baseline_ticket_ids.update(self._last_known_dashboard_tickets)
+        self._dashboard_baseline_initialized = bool(dashboard_ready)
+        if dashboard_ready:
+            self.status_update.emit(
+                f"Dashboard baseline recorded: {len(self._last_known_dashboard_tickets)} existing ticket(s)."
+            )
+        else:
+            # Important safety behavior: leave initialization deferred.  The first
+            # real dashboard snapshot seen by the monitor loop becomes the baseline
+            # and is NOT opened as a set of new tickets.
+            self.status_update.emit(
+                "Dashboard was still loading; baseline deferred until the first real ticket snapshot."
+            )
+
+        # Also baseline any ticket-detail tabs that already exist in the browser.
+        try:
+            current_handles = list(self.driver.window_handles)
+            self._target_handle_map = self._build_target_to_handle_map() if current_handles else {}
+            self._last_handle_count = len(current_handles)
+            for _target_id, url in self._get_all_tab_urls().items():
+                match = LIVE_MONITOR_TICKET_URL_RE.search(url or "")
+                if match:
+                    ticket_id = match.group(1).strip().upper()
+                    if ticket_id:
+                        self._baseline_ticket_ids.add(ticket_id)
+                        self.processed_urls.add(url)
+        except Exception as e:
+            self.status_update.emit(f"Open-tab baseline warning: {e}")
+
+        # Effective monitoring begins only after the baseline snapshot is complete.
+        self._monitoring_cutoff = datetime.now()
+        self.status_update.emit(
+            f"Live capture cutoff set to {self._monitoring_cutoff.strftime('%d/%m/%Y %I:%M:%S %p')}."
+        )
+
+    def _parse_live_ticket_datetime(self, raw_value):
+        """Best-effort parser for ITMIS ticket start datetime strings.
+
+        IMPORTANT: preserve AM/PM before trying 24-hour formats.  The previous
+        parser also extracted ``18/08/2026 01:07`` from ``01:07 PM`` and tried
+        that candidate first, which converted a 1:07 PM ticket into 1:07 AM.
+        """
+        if not raw_value:
+            return None
+
+        text = re.sub(r"\s+", " ", str(raw_value)).strip().upper()
+
+        # 1) Prefer an explicit AM/PM timestamp and parse it only as 12-hour time.
+        ampm_patterns = (
+            (r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M", "%d/%m/%Y"),
+            (r"\d{1,2}/\d{1,2}/\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M", "%d/%m/%y"),
+        )
+        for pattern, date_fmt in ampm_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = re.sub(r"\s+", " ", match.group(0)).strip().upper()
+            for time_fmt in ("%I:%M:%S %p", "%I:%M %p"):
+                try:
+                    return datetime.strptime(candidate, f"{date_fmt} {time_fmt}")
+                except ValueError:
+                    pass
+
+        # 2) Only if no AM/PM timestamp was present, allow a true 24-hour time.
+        # The negative look-ahead prevents matching the ``01:07`` prefix of
+        # ``01:07 PM``.
+        hour24_patterns = (
+            (r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?(?!\s*[AP]M)", "%d/%m/%Y"),
+            (r"\d{1,2}/\d{1,2}/\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?(?!\s*[AP]M)", "%d/%m/%y"),
+        )
+        for pattern, date_fmt in hour24_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = re.sub(r"\s+", " ", match.group(0)).strip()
+            for time_fmt in ("%H:%M:%S", "%H:%M"):
+                try:
+                    return datetime.strptime(candidate, f"{date_fmt} {time_fmt}")
+                except ValueError:
+                    pass
+
+        return None
+
+    def _is_pre_session_ticket(self, raw_time):
+        """Return True only when a parsed ticket time is definitely before monitoring began."""
+        if self._monitoring_cutoff is None:
+            return False
+        ticket_dt = self._parse_live_ticket_datetime(raw_time)
+        if ticket_dt is None:
+            # Never discard a potentially new ticket merely because ITMIS changed
+            # its date format; startup baselines remain the primary protection.
+            return False
+
+        # ITMIS often displays minute precision only. Compare at minute precision
+        # so a ticket created in the same minute as baseline activation is retained.
+        cutoff_minute = self._monitoring_cutoff.replace(second=0, microsecond=0)
+        ticket_minute = ticket_dt.replace(second=0, microsecond=0)
+        is_old = ticket_minute < cutoff_minute
+
+        # Keep a precise trace for future timing diagnostics.  This is emitted only
+        # when the dashboard asks us to classify a newly appearing row, not on every
+        # 200 ms snapshot.
+        self.status_update.emit(
+            "Ticket time check: "
+            f"raw='{raw_time}' -> {ticket_minute.strftime('%d/%m/%Y %I:%M %p')}; "
+            f"cutoff={cutoff_minute.strftime('%d/%m/%Y %I:%M %p')}; "
+            f"result={'OLD' if is_old else 'NEW'}"
+        )
+        return is_old
+
     def _patrol_loop(self):
+        """Run a dashboard-first patrol without letting tab/CDP work delay detection."""
         while not self._stop_event.is_set():
             try:
-                current_handles = []
-                extractions_to_start = []
-                tab_urls = {}
-
                 try:
                     with self._driver_lock:
                         current_handles = list(self.driver.window_handles)
@@ -1615,60 +1784,69 @@ class LiveMonitorThread(QThread):
                         self._all_tabs_closed_announced = True
                     self._last_handle_count = 0
                     self.monitor_stats.emit(0, len(self.captured_tickets))
-                    self._stop_event.wait(0.2)
+                    self._stop_event.wait(0.05)
                     continue
 
                 self._all_tabs_closed_announced = False
-                self._cleanup_stale_handles(current_handles)
 
-                # Rebuild target map OUTSIDE the main lock — it acquires its own locks internally
-                if len(current_handles) != self._last_handle_count:
-                    self._target_handle_map = self._build_target_to_handle_map()
-                    self._last_handle_count = len(current_handles)
-
-                # Read all tab URLs via CDP — no focus switching
-                tab_urls = self._get_all_tab_urls()
-
-                for target_id, url in tab_urls.items():
-                    handle = self._target_handle_map.get(target_id)
-                    if not handle:
-                        continue
-
-                    match = LIVE_MONITOR_TICKET_URL_RE.search(url)
-                    if not match:
-                        continue
-
-                    ticket_id = match.group(1).strip().upper()
-
-                    if ticket_id in self._processed_ids or url in self.processed_urls:
-                        if ticket_id not in self._duplicate_reported_ids:
-                            self._duplicate_reported_ids.add(ticket_id)
-                            self.duplicate_detected.emit(ticket_id)
-                        continue
-
-                    self.processed_urls.add(url)
-                    self._processed_ids.add(ticket_id)
-                    self.tab_pending[handle] = 3
-                    self._extracting_handles.add(handle)
-
-                    try:
-                        tab_index = current_handles.index(handle) + 1
-                    except ValueError:
-                        tab_index = 1
-
-                    extractions_to_start.append((handle, url, ticket_id, tab_index))
-
-                self.monitor_stats.emit(len(current_handles), len(self.captured_tickets))
-
-                for handle, url, ticket_id, tab_index in extractions_to_start:
-                    Thread(
-                        target=self._extract_from_handle,
-                        args=(handle, url, ticket_id, tab_index),
-                        daemon=True,
-                    ).start()
-
-                # Monitor dashboard and notifications for new tickets
+                # Highest priority: poll the live dashboard first. This path can run
+                # every ~200 ms and is intentionally independent of slower CDP scans.
                 self._monitor_dashboard_and_notifications()
+
+                # Manual/open-tab discovery is useful but does not need to run 20
+                # times per second. Throttling it keeps ChromeDriver free for the
+                # dashboard watcher.
+                now = time.time()
+                if now - self._last_tab_scan_time >= self._tab_scan_interval:
+                    self._last_tab_scan_time = now
+                    extractions_to_start = []
+
+                    self._cleanup_stale_handles(current_handles)
+
+                    if len(current_handles) != self._last_handle_count:
+                        self._target_handle_map = self._build_target_to_handle_map()
+                        self._last_handle_count = len(current_handles)
+
+                    tab_urls = self._get_all_tab_urls()
+
+                    for target_id, url in tab_urls.items():
+                        handle = self._target_handle_map.get(target_id)
+                        if not handle:
+                            continue
+
+                        match = LIVE_MONITOR_TICKET_URL_RE.search(url)
+                        if not match:
+                            continue
+
+                        ticket_id = match.group(1).strip().upper()
+
+                        if (ticket_id in self._baseline_ticket_ids or
+                                ticket_id in self._processed_ids or url in self.processed_urls):
+                            if ticket_id not in self._duplicate_reported_ids:
+                                self._duplicate_reported_ids.add(ticket_id)
+                                self.duplicate_detected.emit(ticket_id)
+                            continue
+
+                        self.processed_urls.add(url)
+                        self._processed_ids.add(ticket_id)
+                        self.tab_pending[handle] = 3
+                        self._extracting_handles.add(handle)
+
+                        try:
+                            tab_index = current_handles.index(handle) + 1
+                        except ValueError:
+                            tab_index = 1
+
+                        extractions_to_start.append((handle, url, ticket_id, tab_index))
+
+                    self.monitor_stats.emit(len(current_handles), len(self.captured_tickets))
+
+                    for handle, url, ticket_id, tab_index in extractions_to_start:
+                        Thread(
+                            target=self._extract_from_handle,
+                            args=(handle, url, ticket_id, tab_index),
+                            daemon=True,
+                        ).start()
 
             except WebDriverException as e:
                 self.error_occurred.emit(f"Browser disconnected: {e}")
@@ -1677,7 +1855,9 @@ class LiveMonitorThread(QThread):
             except Exception as e:
                 self.status_update.emit(f"Patrol loop error: {e}")
 
-            self._stop_event.wait(0.5)
+            # 50 ms scheduler tick; the dashboard method itself enforces the
+            # 200 ms scan interval.
+            self._stop_event.wait(0.05)
 
     def _wait_page_settle(self, handle, timeout=1.5):
         deadline = time.time() + timeout
@@ -1696,78 +1876,139 @@ class LiveMonitorThread(QThread):
         return True
 
     def _extract_from_handle(self, handle, ticket_url, ticket_id, tab_index):
-        time.sleep(0.5)
+        """Extract a newly opened ticket quickly without monopolizing Selenium.
+
+        The previous version held the driver lock while performing three separate
+        WebDriverWait(..., 3) XPath lookups.  In the worst case that delayed a
+        ticket by many seconds and also blocked the dashboard watcher.  This
+        version reads all three fields in one browser-side JavaScript call and
+        polls briefly while Angular fills the page.
+        """
         tab_title = f"Tab {tab_index}"
-        retries = 3
-        self.tab_pending[handle] = retries
+        self.tab_pending[handle] = 1
+        deadline = time.time() + 6.0
+        first_partial = None
+        wrong_url_since = None
 
         try:
-            for attempt in range(retries):
-                if self._stop_event.is_set():
-                    return
+            while time.time() < deadline and not self._stop_event.is_set():
                 previous_handle = None
+                time_val = station_val = desc_val = ""
                 try:
                     with self._driver_lock:
+                        handles = list(self.driver.window_handles)
+                        if handle not in handles:
+                            return
+
                         try:
                             previous_handle = self.driver.current_window_handle
                         except Exception:
                             previous_handle = None
 
-                        if handle not in self.driver.window_handles:
-                            return
-
                         self.driver.switch_to.window(handle)
                         current_url = self.driver.current_url or ""
+
+                        # A freshly-created background tab may report about:blank
+                        # for a fraction of a second.  Do not abandon it immediately.
                         if ticket_id.upper() not in current_url.upper():
-                            if previous_handle and previous_handle in self.driver.window_handles:
+                            if current_url and current_url != "about:blank":
+                                if wrong_url_since is None:
+                                    wrong_url_since = time.time()
+                                elif time.time() - wrong_url_since > 1.0:
+                                    if previous_handle and previous_handle in handles:
+                                        self.driver.switch_to.window(previous_handle)
+                                    self.status_update.emit(
+                                        f"Ticket tab changed before extraction: {ticket_id}"
+                                    )
+                                    return
+                            if previous_handle and previous_handle in handles:
                                 self.driver.switch_to.window(previous_handle)
+                        else:
+                            wrong_url_since = None
+                            values = self.driver.execute_script(
+                                """
+                                const textAtXPath = (xp) => {
+                                    try {
+                                        const node = document.evaluate(
+                                            xp, document, null,
+                                            XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                                        ).singleNodeValue;
+                                        if (!node) return '';
+                                        return (node.innerText || node.textContent || '').trim();
+                                    } catch (e) {
+                                        return '';
+                                    }
+                                };
+                                return [
+                                    textAtXPath(arguments[0]),
+                                    textAtXPath(arguments[1]),
+                                    textAtXPath(arguments[2]),
+                                    document.title || ''
+                                ];
+                                """,
+                                self.config.TICKET_START_TIME_XPATH,
+                                self.config.STATION_XPATH,
+                                self.config.CONTENT_XPATH,
+                            ) or ["", "", "", ""]
+                            time_val = (values[0] or "").strip()
+                            station_val = (values[1] or "").strip()
+                            desc_val = (values[2] or "").strip()
+                            tab_title = (values[3] or tab_title).strip() or tab_title
+
+                            if previous_handle and previous_handle in handles:
+                                self.driver.switch_to.window(previous_handle)
+
+                    if any((time_val, station_val, desc_val)):
+                        if first_partial is None:
+                            first_partial = time.time()
+
+                        # Prefer a complete record, but do not hold a genuinely new
+                        # ticket for several seconds just because one secondary field
+                        # is slow to render.
+                        complete = bool(time_val and station_val and desc_val)
+                        partial_ready = first_partial and (time.time() - first_partial >= 0.25)
+                        if complete or partial_ready:
+                            if self._is_pre_session_ticket(time_val):
+                                self.status_update.emit(
+                                    f"Ignored old ticket {ticket_id}: ticket start time {time_val} "
+                                    "is before the live-monitor cutoff."
+                                )
+                                return
+
+                            captured_at = datetime.now()
+                            statement_time = time_val or "Unknown time"
+                            station_info = station_val or "Unknown station"
+                            description = desc_val or "No description"
+                            formatted = (
+                                f"{statement_time} PMA issued a ticket ({ticket_id}) "
+                                f"at {station_info} - {description}"
+                            )
+                            record = {
+                                "ticket_id": ticket_id,
+                                "ticket_url": ticket_url,
+                                "time": statement_time,
+                                "station": station_info,
+                                "description": description,
+                                "formatted_statement": formatted,
+                                "formatted": formatted,
+                                "captured_at": captured_at.isoformat(),
+                                "tab_index": tab_index,
+                                "tab_title": tab_title,
+                                "tab_label": tab_title or f"Tab {tab_index}",
+                            }
+                            self.captured_tickets.append(record)
+                            self.ticket_captured.emit(record)
+                            self.status_update.emit(
+                                f"Captured new ticket {ticket_id} at {captured_at.strftime('%H:%M:%S')}"
+                            )
                             return
 
-                        WebDriverWait(self.driver, 3).until(
-                            lambda d: d.execute_script("return document.readyState") == "complete"
-                        )
-
-                        time_val = self._safe_xpath(self.config.TICKET_START_TIME_XPATH)
-                        station_val = self._safe_xpath(self.config.STATION_XPATH)
-                        desc_val = self._safe_xpath(self.config.CONTENT_XPATH)
-                        tab_title = self.driver.title or tab_title
-
-                        if previous_handle and previous_handle in self.driver.window_handles:
-                            self.driver.switch_to.window(previous_handle)
-
-                    if any(v and v != "Unknown" for v in (time_val, station_val, desc_val)):
-                        captured_at = datetime.now()
-                        statement_time = time_val or "Unknown time"
-                        station_info = station_val or "Unknown station"
-                        description = desc_val or "No description"
-                        formatted = (
-                            f"{statement_time} PMA issued a ticket ({ticket_id}) "
-                            f"at {station_info} - {description}"
-                        )
-                        record = {
-                            "ticket_id": ticket_id,
-                            "ticket_url": ticket_url,
-                            "time": statement_time,
-                            "station": station_info,
-                            "description": description,
-                            "formatted_statement": formatted,
-                            "formatted": formatted,
-                            "captured_at": captured_at.isoformat(),
-                            "tab_index": tab_index,
-                            "tab_title": tab_title,
-                            "tab_label": tab_title or f"Tab {tab_index}",
-                        }
-                        self.captured_tickets.append(record)
-                        self.ticket_captured.emit(record)
-                        return
-
                 except Exception as e:
-                    self.status_update.emit(f"Retry {attempt + 1}/3 for {ticket_id}: {e}")
+                    self.status_update.emit(f"Ticket extraction retry for {ticket_id}: {e}")
 
-                self.tab_pending[handle] = retries - attempt - 1
-                time.sleep(1)
+                self._stop_event.wait(0.12)
 
-            self.status_update.emit(f"Failed to extract {ticket_id} after 3 attempts.")
+            self.status_update.emit(f"Failed to extract {ticket_id} within 6 seconds.")
         finally:
             self._extracting_handles.discard(handle)
             self.tab_pending.pop(handle, None)
@@ -1982,147 +2223,293 @@ class LiveMonitorThread(QThread):
             self.status_update.emit(f"Extract ticket from dashboard error: {e}")
             return None, None
 
+    def _wait_for_stable_dashboard_baseline(self, max_rows=15, timeout=12.0):
+        """Return (tickets, ready) after the dashboard has reached a stable real state.
+
+        A stable baseline prevents the Angular loading placeholder from being
+        mistaken for an empty dashboard.  Two matching real snapshots are required
+        for a non-empty dashboard.  A genuinely empty dashboard is accepted after a
+        short stable period.  If loading never finishes, ready=False causes the
+        monitor loop to adopt the first real snapshot as its baseline instead of
+        opening those rows.
+        """
+        deadline = time.time() + max(2.0, float(timeout))
+        first_real_seen = None
+        previous = None
+        stable_matches = 0
+        last_tickets = []
+
+        while time.time() < deadline and not self._stop_event.is_set():
+            tickets, _details = self._scan_all_dashboard_rows(max_rows=max_rows)
+            tickets = list(tickets or [])
+            last_tickets = tickets
+
+            if self._last_dashboard_scan_was_loading:
+                previous = None
+                stable_matches = 0
+                self.status_update.emit("Dashboard is still loading — waiting before baseline capture...")
+                self._stop_event.wait(0.5)
+                continue
+
+            if first_real_seen is None:
+                first_real_seen = time.time()
+
+            if previous == tickets:
+                stable_matches += 1
+            else:
+                previous = list(tickets)
+                stable_matches = 0
+
+            # Two matching non-empty snapshots are enough to establish the normal
+            # 15-row baseline.  For a genuinely empty dashboard, wait a little
+            # longer so a slow-loading table is not mistaken for zero tickets.
+            if tickets and stable_matches >= 1:
+                return tickets, True
+            if not tickets and stable_matches >= 2 and time.time() - first_real_seen >= 2.0:
+                return [], True
+
+            self._stop_event.wait(0.5)
+
+        return last_tickets, False
+
     def _scan_all_dashboard_rows(self, max_rows=10):
-        """Scan multiple rows from dashboard and extract all ticket numbers with details."""
+        """Read the dashboard table in one browser-side snapshot.
+
+        This avoids dozens of Selenium round-trips per scan.  It also uses a
+        dedicated dashboard handle, so background ticket extraction can never
+        accidentally turn the ticket tab back into the dashboard.
+        """
+        self._last_dashboard_scan_was_loading = False
+        raw_rows = []
         try:
             with self._driver_lock:
-                # Navigate to dashboard if not already there
-                current_url = self.driver.current_url or ""
-                if "dashboard" not in current_url.lower():
-                    self.driver.get(self.config.DASHBOARD_URL)
-                    time.sleep(2)  # Wait for page to load
-                
-                # Wait for dashboard table to be present
+                handles = list(self.driver.window_handles)
+                if not handles:
+                    return [], {}
+
                 try:
-                    WebDriverWait(self.driver, 5).until(
-                        EC.presence_of_element_located((By.XPATH, self.config.DASHBOARD_FIRST_TICKET_XPATH))
-                    )
-                except:
-                    self.status_update.emit("Dashboard table not loaded within timeout")
-                    return []
-                
-                # Get row count from dashboard table
-                all_rows = self.driver.find_elements(By.XPATH, 
-                    '/html/body/app-root/app-init-app/div/div/app-dashboard/div/div[4]/div/div/div/p-scrollpanel/div/div[1]/div/p-table/div/div/table/tbody/tr')
-                
-                if not all_rows:
-                    self.status_update.emit("No rows found in dashboard table")
-                    return []
-                
-                current_tickets = []  # List of ticket numbers for comparison
-                ticket_details = {}  # Dictionary mapping ticket number to details
-                rows_to_scan = min(len(all_rows), max_rows)
-                
-                self.status_update.emit(f"Scanning {rows_to_scan} rows from dashboard...")
-                
-                for i in range(rows_to_scan):
-                    # Re-fetch each row individually to avoid stale element reference
+                    original_handle = self.driver.current_window_handle
+                except Exception:
+                    original_handle = handles[0]
+
+                # Keep a stable dashboard tab for monitoring.
+                if self._dashboard_handle not in handles:
+                    self._dashboard_handle = None
+                    # Prefer the currently selected tab when it is already dashboard.
                     try:
-                        row = self.driver.find_element(By.XPATH, 
-                            f'/html/body/app-root/app-init-app/div/div/app-dashboard/div/div[4]/div/div/div/p-scrollpanel/div/div[1]/div/p-table/div/div/table/tbody/tr[{i+1}]')
-                    except:
-                        self.status_update.emit(f"Row {i+1} not found, skipping")
-                        continue
-                    try:
-                        # Get row text for debugging
-                        row_text = row.text
-                        if i == 0:  # Log first row text for debugging
-                            self.status_update.emit(f"Row 1 text: {row_text[:100]}...")
-                        
-                        # Try to extract ticket from row text using partial regex
-                        match = TICKET_REGEX_PARTIAL.search(row_text)
-                        if match:
-                            partial_ticket = match.group(0)
-                            # Try to find full ticket from links
-                            # First try the specific link in td[1]/a (ticket number column)
-                            ticket_number = None
+                        if "dashboard" in (self.driver.current_url or "").lower():
+                            self._dashboard_handle = original_handle
+                    except Exception:
+                        pass
+
+                    if self._dashboard_handle is None:
+                        for candidate in handles:
                             try:
-                                first_cell_link = row.find_element(By.XPATH, './/td[1]/a')
-                                link_href = first_cell_link.get_attribute('href')
-                                if link_href and link_href != 'javascript:void(0)':
-                                    href_match = TICKET_REGEX.search(link_href)
-                                    if href_match:
-                                        ticket_number = href_match.group(0)
-                            except:
-                                pass
-                            
-                            # Fallback: search all links in the row
-                            if not ticket_number:
-                                link_elements = row.find_elements(By.TAG_NAME, 'a')
-                                for link in link_elements:
-                                    link_href = link.get_attribute('href')
-                                    if link_href and link_href != 'javascript:void(0)':
-                                        href_match = TICKET_REGEX.search(link_href)
-                                        if href_match:
-                                            ticket_number = href_match.group(0)
-                                            break
-                            
-                            # If still no ticket number from href, construct from partial
-                            if not ticket_number:
-                                full_ticket = f"LHR.L2SP.{partial_ticket}"
-                                if TICKET_REGEX.match(full_ticket):
-                                    ticket_number = full_ticket
-                            
-                            if ticket_number:
-                                if ticket_number not in current_tickets:
-                                    current_tickets.append(ticket_number)
-                                    # Extract additional details from row text
-                                    words = row_text.split()
-                                    # Parse row text: YYYY.MM.XXXXXXX Assignee Station Description Status Category Priority Date
-                                    details = {
-                                        "assignee": "Unknown",
-                                        "station": "Unknown",
-                                        "description": "Unknown",
-                                        "priority": "Unknown",
-                                        "date": "Unknown"
-                                    }
-                                    
-                                    # Try to extract details based on position
-                                    # Pattern: ticket (0) assignee (1) station (2) description (3-?) status category priority date
-                                    if len(words) >= 3:
-                                        # Skip the ticket number (first word)
-                                        idx = 1
-                                        # Assignee (next word after ticket)
-                                        if idx < len(words):
-                                            details["assignee"] = words[idx]
-                                            idx += 1
-                                        # Station (next word - typically uppercase)
-                                        if idx < len(words):
-                                            details["station"] = words[idx]
-                                            idx += 1
-                                        # Description (words until we hit known status/category/priority keywords)
-                                        known_keywords = {"Assigned", "Unassigned", "Fault", "Rectification", "Critical", "High", "Medium", "Low", "Non-Critical"}
-                                        desc_words = []
-                                        while idx < len(words) and words[idx] not in known_keywords:
-                                            desc_words.append(words[idx])
-                                            idx += 1
-                                        if desc_words:
-                                            details["description"] = " ".join(desc_words)
-                                        # Priority (look for priority keywords)
-                                        priority_keywords = {"Critical", "High", "Medium", "Low", "Non-Critical"}
-                                        for word in words:
-                                            if word in priority_keywords:
-                                                details["priority"] = word
-                                                break
-                                        # Date (look for date pattern DD/MM/YY)
-                                        for word in words:
-                                            if "/" in word and len(word) >= 8:
-                                                details["date"] = word
-                                                break
-                                    
-                                    ticket_details[ticket_number] = details
-                                    self.status_update.emit(f"Extracted ticket {ticket_number}: {details['assignee']} - {details['description']}")
-                    
-                    except Exception as e:
-                        self.status_update.emit(f"Error scanning row {i+1}: {e}")
-                        continue
-                
-                self.status_update.emit(f"Total tickets found in dashboard: {len(current_tickets)}")
-                return current_tickets, ticket_details
-                
+                                self.driver.switch_to.window(candidate)
+                                if "dashboard" in (self.driver.current_url or "").lower():
+                                    self._dashboard_handle = candidate
+                                    break
+                            except Exception:
+                                continue
+
+                    # At startup there may not yet be a dashboard tab; reuse the
+                    # current app tab once and keep its handle from then on.
+                    if self._dashboard_handle is None:
+                        self._dashboard_handle = original_handle
+                        self.driver.switch_to.window(self._dashboard_handle)
+                        self.driver.get(self.config.DASHBOARD_URL)
+
+                self.driver.switch_to.window(self._dashboard_handle)
+                if "dashboard" not in (self.driver.current_url or "").lower():
+                    self.driver.get(self.config.DASHBOARD_URL)
+
+                raw_rows = self.driver.execute_script(
+                    """
+                    const maxRows = arguments[0];
+                    let rows = Array.from(document.querySelectorAll('app-dashboard p-table tbody tr'));
+
+                    // Exact-path fallback for the current ITMIS layout.
+                    if (!rows.length) {
+                        try {
+                            const xp = '/html/body/app-root/app-init-app/div/div/app-dashboard/div/div[4]/div/div/div/p-scrollpanel/div/div[1]/div/p-table/div/div/table/tbody/tr';
+                            const snap = document.evaluate(
+                                xp, document, null,
+                                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+                            );
+                            rows = [];
+                            for (let i = 0; i < snap.snapshotLength; i++) {
+                                rows.push(snap.snapshotItem(i));
+                            }
+                        } catch (e) {}
+                    }
+
+                    return rows.slice(0, maxRows).map(row => ({
+                        text: (row.innerText || row.textContent || '').trim(),
+                        cells: Array.from(row.querySelectorAll('td')).map(td =>
+                            (td.innerText || td.textContent || '').trim()
+                        ),
+                        hrefs: Array.from(row.querySelectorAll('a')).map(a =>
+                            a.href || a.getAttribute('href') || ''
+                        )
+                    }));
+                    """,
+                    int(max_rows),
+                ) or []
+
+                # Preserve the user's selected tab.
+                if original_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(original_handle)
+
+            if not raw_rows:
+                return [], {}
+
+            current_tickets = []
+            ticket_details = {}
+
+            for i, row_data in enumerate(raw_rows[:max_rows]):
+                row_text = str((row_data or {}).get("text", "") or "").strip()
+                if i == 0 and row_text:
+                    # Keep the first-row trace because it is useful for diagnosing
+                    # ITMIS-side delays without logging all 15 rows every second.
+                    self.status_update.emit(f"Row 1 text: {row_text[:100]}...")
+
+                row_text_lower = row_text.lower()
+                if ("loading ticket" in row_text_lower or
+                        "fetching the latest service tickets" in row_text_lower):
+                    self._last_dashboard_scan_was_loading = True
+                    continue
+
+                match = TICKET_REGEX_PARTIAL.search(row_text)
+                if not match:
+                    continue
+
+                partial_ticket = match.group(0)
+                ticket_number = None
+                for link_href in (row_data or {}).get("hrefs", []) or []:
+                    if link_href and link_href != "javascript:void(0)":
+                        href_match = TICKET_REGEX.search(str(link_href))
+                        if href_match:
+                            ticket_number = href_match.group(0).upper()
+                            break
+
+                if not ticket_number:
+                    candidate = f"LHR.L2SP.{partial_ticket}".upper()
+                    if TICKET_REGEX.match(candidate):
+                        ticket_number = candidate
+
+                if not ticket_number or ticket_number in current_tickets:
+                    continue
+
+                current_tickets.append(ticket_number)
+                words = row_text.split()
+                details = {
+                    "assignee": "Unknown",
+                    "station": "Unknown",
+                    "description": "Unknown",
+                    "priority": "Unknown",
+                    "date": "Unknown",
+                }
+
+                # The table already contains enough information to show the ticket
+                # immediately. Prefer real cells over guessing from whitespace.
+                cells = [
+                    str(v or "").strip()
+                    for v in ((row_data or {}).get("cells", []) or [])
+                ]
+                if len(cells) >= 4:
+                    if len(cells) > 1 and cells[1]:
+                        details["assignee"] = cells[1]
+                    if len(cells) > 2 and cells[2]:
+                        details["station"] = cells[2]
+                    if len(cells) > 3 and cells[3]:
+                        details["description"] = cells[3]
+
+                    for cell in cells:
+                        if cell in {"Critical", "High", "Medium", "Low", "Non-Critical"}:
+                            details["priority"] = cell
+                            break
+                    for cell in cells:
+                        if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", cell):
+                            details["date"] = cell
+                            break
+                elif len(words) >= 3:
+                    # Fallback for layouts where the PrimeNG row exposes no td cells.
+                    idx = 1
+                    if idx < len(words):
+                        details["assignee"] = words[idx]
+                        idx += 1
+                    if idx < len(words):
+                        details["station"] = words[idx]
+                        idx += 1
+                    known_keywords = {
+                        "Assigned", "Unassigned", "Fault", "Rectification",
+                        "Critical", "High", "Medium", "Low", "Non-Critical",
+                    }
+                    desc_words = []
+                    while idx < len(words) and words[idx] not in known_keywords:
+                        desc_words.append(words[idx])
+                        idx += 1
+                    if desc_words:
+                        details["description"] = " ".join(desc_words)
+                    for word in words:
+                        if word in {"Critical", "High", "Medium", "Low", "Non-Critical"}:
+                            details["priority"] = word
+                            break
+                    for word in words:
+                        if "/" in word and len(word) >= 8:
+                            details["date"] = word
+                            break
+
+                ticket_details[ticket_number] = details
+
+            return current_tickets, ticket_details
+
         except Exception as e:
             self.status_update.emit(f"Scan dashboard rows error: {e}")
-            return []
+            return [], {}
+
+    def _force_dashboard_data_refresh(self):
+        """Force the dedicated dashboard tab to fetch fresh ITMIS data.
+
+        The 200 ms scanner only observes what Angular has already rendered. In
+        real runs the row can remain unchanged for tens of seconds even though a
+        ticket's own timestamp is newer. A CDP Page.reload on the dashboard tab
+        is asynchronous and avoids blocking on a full Selenium ``driver.refresh``.
+        It is intentionally isolated to the dashboard handle so detail tabs are
+        never disturbed.
+        """
+        try:
+            with self._driver_lock:
+                handles = list(self.driver.window_handles)
+                if not handles or self._dashboard_handle not in handles:
+                    return False
+
+                try:
+                    original_handle = self.driver.current_window_handle
+                except Exception:
+                    original_handle = handles[0]
+
+                self.driver.switch_to.window(self._dashboard_handle)
+
+                # CDP reload is faster/non-blocking compared with driver.refresh().
+                # ignoreCache helps avoid a stale dashboard shell/API bootstrap.
+                try:
+                    self.driver.execute_cdp_cmd("Page.reload", {"ignoreCache": True})
+                except Exception:
+                    # Fallback if the Chrome/driver build rejects Page.reload.
+                    self.driver.execute_script("window.location.reload();")
+
+                if original_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(original_handle)
+
+            self.status_update.emit(
+                f"Forced dashboard data refresh at "
+                f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
+            )
+            return True
+        except Exception as e:
+            self.status_update.emit(f"Dashboard force-refresh error: {e}")
+            return False
 
     def _get_notification_count(self):
         """Get the current notification count from the bell icon."""
@@ -2275,17 +2662,33 @@ class LiveMonitorThread(QThread):
             return None, None
 
     def _open_ticket_in_new_tab(self, ticket_url):
-        """Open ticket URL in a new browser tab. Returns the new window handle, or None on failure."""
+        """Open a ticket in a background tab without blocking on full page load."""
         try:
             with self._driver_lock:
-                # Open new tab
-                self.driver.execute_script("window.open('');")
-                new_handle = self.driver.window_handles[-1]
-                # Switch to new tab
-                self.driver.switch_to.window(new_handle)
-                # Navigate to ticket URL
-                self.driver.get(ticket_url)
-                time.sleep(1)  # Wait for page to load
+                before = set(self.driver.window_handles)
+                original_handle = self.driver.current_window_handle
+
+                # Opening the final URL directly is much faster than opening a blank
+                # tab, switching to it, driver.get(...), sleeping, then switching back.
+                self.driver.execute_script(
+                    "window.open(arguments[0], '_blank');", ticket_url
+                )
+
+                deadline = time.time() + 1.0
+                new_handle = None
+                while time.time() < deadline and not self._stop_event.is_set():
+                    handles = list(self.driver.window_handles)
+                    created = [h for h in handles if h not in before]
+                    if created:
+                        new_handle = created[-1]
+                        break
+                    time.sleep(0.03)
+
+                # window.open normally leaves focus on the dashboard, but force it
+                # back to the original handle so the monitor and extractor cannot race.
+                if original_handle in self.driver.window_handles:
+                    self.driver.switch_to.window(original_handle)
+
                 return new_handle
         except Exception as e:
             self.status_update.emit(f"Open ticket in new tab error: {e}")
@@ -2341,126 +2744,174 @@ class LiveMonitorThread(QThread):
             self._capture_ticket_via_new_tab(ticket_id, ticket_url, source_label="Restored")
             time.sleep(1.5)  # stagger tab opens so Chrome/Angular aren't hit all at once
 
+    def _emit_immediate_dashboard_record(self, ticket_number, ticket_url, details):
+        """Surface a newly visible dashboard ticket immediately.
+
+        Full ticket-page extraction still runs in the background and replaces this
+        preliminary record. This removes the page-load delay from what the operator
+        sees in Live Monitor.
+        """
+        now = datetime.now()
+        details = details or {}
+        station = str(details.get("station") or "Unknown station").strip()
+        description = str(details.get("description") or "No description").strip()
+        row_time = str(details.get("date") or "Dashboard time pending").strip()
+
+        formatted = (
+            f"{row_time} PMA issued a ticket ({ticket_number}) "
+            f"at {station} - {description}"
+        )
+        record = {
+            "ticket_id": ticket_number,
+            "ticket_url": ticket_url,
+            "time": row_time,
+            "station": station,
+            "description": description,
+            "priority": str(details.get("priority") or "Unknown"),
+            "assignee": str(details.get("assignee") or "Unknown"),
+            "formatted_statement": formatted,
+            "formatted": formatted,
+            "captured_at": now.isoformat(),
+            "tab_index": 0,
+            "tab_title": "Dashboard",
+            "tab_label": "Dashboard",
+            "preliminary": True,
+        }
+        self.ticket_captured.emit(record)
+        self.status_update.emit(
+            f"Immediate dashboard capture {ticket_number} at {now.strftime('%H:%M:%S.%f')[:-3]}"
+        )
+
     def _monitor_dashboard_and_notifications(self):
-        """Monitor dashboard and notification bell for new tickets."""
+        """Monitor the dashboard at high frequency and notifications independently."""
         if not self._dashboard_monitoring_enabled:
             return
-        
+
         try:
             current_time = time.time()
-            
-            # Check notification count (every cycle)
-            current_notification_count = self._get_notification_count()
-            
-            # Check if notification count increased
-            if current_notification_count > self._last_notification_count:
-                self.status_update.emit(f"New notifications detected: {current_notification_count}")
-                
-                # Open notification dropdown
-                if self._open_notification_dropdown():
-                    # Extract ticket from first notification
-                    ticket_number, ticket_url = self._extract_ticket_from_notification()
-                    
-                    if ticket_number and ticket_url:
-                        # Check if this ticket is already processed
-                        if ticket_number not in self._processed_ids:
-                            self.status_update.emit(f"New ticket detected from notification: {ticket_number}")
-                            
-                            # Generate a preliminary ticket record from notification
-                            captured_at = datetime.now()
-                            preliminary_record = {
-                                "ticket_id": ticket_number,
-                                "ticket_url": ticket_url,
-                                "time": "Unknown time",
-                                "station": "Unknown station",
-                                "description": f"Ticket detected from notification bell",
-                                "formatted_statement": f"Ticket {ticket_number} detected from notification bell - awaiting details",
-                                "formatted": f"Ticket {ticket_number} detected from notification bell - awaiting details",
-                                "captured_at": captured_at.isoformat(),
-                                "tab_index": 0,
-                                "tab_title": "Notification",
-                                "tab_label": "Notification",
-                                "preliminary": True
-                            }
-                            self.captured_tickets.append(preliminary_record)
-                            self.ticket_captured.emit(preliminary_record)
 
-                            # Open ticket in new tab and extract full details directly (replaces the
-                            # preliminary record above once extraction completes).
-                            self._capture_ticket_via_new_tab(ticket_number, ticket_url, source_label="Notification")
-                        else:
-                            self.status_update.emit(f"Ticket {ticket_number} already processed")
-                
-                # Update last notification count
-                self._last_notification_count = current_notification_count
-            
-            # Dashboard refresh every 10 seconds
+            # ----- Dashboard: highest priority path -----
+            # This runs before notification-bell work so a visible row is not delayed
+            # by other Selenium calls.
             if current_time - self._last_dashboard_refresh_time >= self._dashboard_refresh_interval:
-                self.status_update.emit("Refreshing dashboard to check for new tickets...")
                 self._last_dashboard_refresh_time = current_time
-                
-                # Scan all dashboard rows to get current tickets and details
-                current_dashboard_tickets, ticket_details = self._scan_all_dashboard_rows(max_rows=15)
-                
-                # Compare with last known tickets to find new ones
-                if not self._last_known_dashboard_tickets:
-                    # First scan, just record the current tickets
-                    self._last_known_dashboard_tickets = current_dashboard_tickets
-                    self.status_update.emit(f"Initial dashboard scan recorded {len(current_dashboard_tickets)} tickets")
-                else:
-                    # Find new tickets (tickets in current but not in last known)
-                    new_tickets = [t for t in current_dashboard_tickets if t not in self._last_known_dashboard_tickets]
-                    
-                    if new_tickets:
-                        self.status_update.emit(f"Found {len(new_tickets)} new ticket(s) on dashboard: {new_tickets}")
-                        
-                        # Process each new ticket
-                        for new_ticket in new_tickets:
-                            if new_ticket not in self._processed_ids:
-                                self.status_update.emit(f"Processing new ticket: {new_ticket}")
-                                
-                                # Construct ticket URL
-                                ticket_url = f"{self.config.BASE_TICKET_URL}{new_ticket}"
-                                
-                                # Get ticket details from dashboard scan
-                                details = ticket_details.get(new_ticket, {})
-                                
-                                # Generate a preliminary ticket record from dashboard with extracted details
-                                captured_at = datetime.now()
-                                preliminary_record = {
-                                    "ticket_id": new_ticket,
-                                    "ticket_url": ticket_url,
-                                    "time": details.get("date", "Unknown time"),
-                                    "station": details.get("station", "Unknown station"),
-                                    "description": details.get("description", "Ticket detected from dashboard scan"),
-                                    "assignee": details.get("assignee", "Unknown"),
-                                    "priority": details.get("priority", "Unknown"),
-                                    "formatted_statement": f"Ticket {new_ticket} - {details.get('assignee', 'Unknown')} - {details.get('description', 'Unknown')} ({details.get('priority', 'Unknown')} priority)",
-                                    "formatted": f"Ticket {new_ticket} - {details.get('assignee', 'Unknown')} - {details.get('description', 'Unknown')} ({details.get('priority', 'Unknown')} priority)",
-                                    "captured_at": captured_at.isoformat(),
-                                    "tab_index": 0,
-                                    "tab_title": "Dashboard",
-                                    "tab_label": "Dashboard",
-                                    "preliminary": True
-                                }
-                                self.captured_tickets.append(preliminary_record)
-                                self.ticket_captured.emit(preliminary_record)
 
-                                # Open ticket in new tab and extract full details directly (replaces the
-                                # preliminary record above once extraction completes).
-                                self._capture_ticket_via_new_tab(new_ticket, ticket_url, source_label="Dashboard")
-                            else:
-                                self.status_update.emit(f"Ticket {new_ticket} already processed")
+                current_dashboard_tickets, ticket_details = self._scan_all_dashboard_rows(max_rows=15)
+                current_dashboard_tickets = current_dashboard_tickets or []
+                ticket_details = ticket_details or {}
+
+                if not self._dashboard_baseline_initialized:
+                    self._last_known_dashboard_tickets = list(current_dashboard_tickets)
+                    self._baseline_ticket_ids.update(current_dashboard_tickets)
+                    self._dashboard_baseline_initialized = True
+                    self.status_update.emit(
+                        f"Dashboard baseline initialized with {len(current_dashboard_tickets)} ticket(s)."
+                    )
+                else:
+                    new_tickets = [
+                        t for t in current_dashboard_tickets
+                        if t not in self._last_known_dashboard_tickets
+                        and t not in self._baseline_ticket_ids
+                    ]
+
+                    if new_tickets:
+                        detected_at = datetime.now()
+                        self.status_update.emit(
+                            f"Found {len(new_tickets)} newly appearing dashboard ticket(s) "
+                            f"at {detected_at.strftime('%H:%M:%S.%f')[:-3]}: {new_tickets}"
+                        )
+
+                        for new_ticket in new_tickets:
+                            if new_ticket in self._processed_ids:
+                                continue
+
+                            details = ticket_details.get(new_ticket, {})
+                            ticket_url = f"{self.config.BASE_TICKET_URL}{new_ticket}"
+
+                            # If the dashboard row itself exposes a start datetime, reject
+                            # an old/reordered row before showing or opening it.
+                            row_time = details.get("date")
+                            if row_time and self._is_pre_session_ticket(row_time):
+                                self._baseline_ticket_ids.add(new_ticket)
+                                self.status_update.emit(
+                                    f"Ignored old/reordered dashboard ticket {new_ticket}: {row_time}"
+                                )
+                                continue
+
+                            # Show it NOW from the dashboard row. The full detail page
+                            # will replace this preliminary card in the background.
+                            self._emit_immediate_dashboard_record(
+                                new_ticket, ticket_url, details
+                            )
+
+                            self.status_update.emit(
+                                f"Opening full details in background: {new_ticket}"
+                            )
+                            self._capture_ticket_via_new_tab(
+                                new_ticket, ticket_url, source_label="Dashboard"
+                            )
+
+                    self._last_known_dashboard_tickets = list(current_dashboard_tickets)
+
+                # IMPORTANT: scanning the DOM faster does not make Angular fetch
+                # fresh data faster. If this scan is still showing a real table
+                # (not its Loading tickets placeholder), periodically refresh the
+                # dedicated dashboard tab so ITMIS re-requests its current ticket
+                # list. While a reload is in progress, push the next refresh out
+                # instead of reloading the page repeatedly before it can settle.
+                if self._last_dashboard_scan_was_loading:
+                    self._last_dashboard_force_refresh_time = current_time
+                elif (
+                    current_time - self._last_dashboard_force_refresh_time
+                    >= self._dashboard_force_refresh_interval
+                ):
+                    if self._force_dashboard_data_refresh():
+                        self._last_dashboard_force_refresh_time = time.time()
                     else:
-                        self.status_update.emit("No new tickets found on dashboard")
-                    
-                    # Update last known tickets
-                    self._last_known_dashboard_tickets = current_dashboard_tickets
-            
-            # Update counts periodically even if no change
-            if current_notification_count != self._last_notification_count:
-                self._last_notification_count = current_notification_count
-                
+                        # Retry soon, but not on every 50 ms scheduler tick.
+                        self._last_dashboard_force_refresh_time = current_time - (
+                            self._dashboard_force_refresh_interval - 0.5
+                        )
+
+            # ----- Notification bell: secondary path -----
+            # Polling it less often prevents its Selenium lookup from slowing the
+            # 200 ms dashboard watcher. It remains a useful fallback.
+            if current_time - self._last_notification_poll_time >= self._notification_poll_interval:
+                self._last_notification_poll_time = current_time
+                current_notification_count = self._get_notification_count()
+
+                if self._last_notification_count is None:
+                    self._last_notification_count = current_notification_count
+                    self.status_update.emit(
+                        f"Notification baseline initialized at {current_notification_count}."
+                    )
+                elif current_notification_count > self._last_notification_count:
+                    increase = current_notification_count - self._last_notification_count
+                    self.status_update.emit(
+                        f"New notification count increased by {increase} "
+                        f"({self._last_notification_count} → {current_notification_count})."
+                    )
+
+                    if self._open_notification_dropdown():
+                        ticket_number, ticket_url = self._extract_ticket_from_notification()
+                        if ticket_number and ticket_url:
+                            ticket_number = ticket_number.strip().upper()
+                            if ticket_number in self._baseline_ticket_ids:
+                                self.status_update.emit(
+                                    f"Ignored pre-existing notification ticket: {ticket_number}"
+                                )
+                            elif ticket_number not in self._processed_ids:
+                                self.status_update.emit(
+                                    f"New ticket detected from notification: {ticket_number}"
+                                )
+                                self._capture_ticket_via_new_tab(
+                                    ticket_number, ticket_url, source_label="Notification"
+                                )
+
+                    self._last_notification_count = current_notification_count
+                elif current_notification_count != self._last_notification_count:
+                    self._last_notification_count = current_notification_count
+
         except Exception as e:
             self.status_update.emit(f"Dashboard/notification monitoring error: {e}")
 
@@ -2834,10 +3285,302 @@ def load_blurred_background(path: str, blur_radius: int = 40) -> QPixmap | None:
             return None
 
 
+class CustomTitleBar(QWidget):
+    """Compact frameless title bar with Pin beside Minimize."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self._drag_global_pos = None
+        self.setObjectName("customTitleBar")
+        self.setFixedHeight(36)
+        self.setStyleSheet("""
+            QWidget#customTitleBar {
+                background: rgba(255, 255, 255, 0.12);
+                border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+            }
+            QLabel#customTitleLabel {
+                color: #3A2E26;
+                font-family: "Segoe UI";
+                font-size: 9pt;
+                font-weight: 700;
+                background: transparent;
+            }
+            QToolButton {
+                background: transparent;
+                color: #3A2E26;
+                border: none;
+                border-radius: 5px;
+                font-family: "Segoe UI";
+                font-size: 10pt;
+                font-weight: 700;
+            }
+            QToolButton:hover {
+                background: rgba(255, 255, 255, 0.22);
+            }
+            QToolButton#pinButton:checked {
+                background: rgba(255, 98, 0, 0.20);
+                color: #D64D00;
+            }
+            QToolButton#closeButton:hover {
+                background: rgba(211, 47, 47, 0.85);
+                color: white;
+            }
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 4, 0)
+        layout.setSpacing(2)
+
+        self.title_label = QLabel(window.windowTitle() or "ITMIS Ticket Scraper")
+        self.title_label.setObjectName("customTitleLabel")
+        layout.addWidget(self.title_label)
+        layout.addStretch()
+
+        self.pin_button = QToolButton()
+        self.pin_button.setObjectName("pinButton")
+        self.pin_button.setText("📌")
+        self.pin_button.setCheckable(True)
+        self.pin_button.setChecked(bool(getattr(window, "_always_on_top", False)))
+        self.pin_button.setToolTip("Keep this window always on top")
+        self.pin_button.setFixedSize(38, 30)
+        self.pin_button.toggled.connect(window._toggle_always_on_top)
+        layout.addWidget(self.pin_button)
+
+        self.min_button = QToolButton()
+        self.min_button.setText("—")
+        self.min_button.setToolTip("Minimize")
+        self.min_button.setFixedSize(42, 30)
+        self.min_button.clicked.connect(window.showMinimized)
+        layout.addWidget(self.min_button)
+
+        self.max_button = QToolButton()
+        self.max_button.setText("□")
+        self.max_button.setToolTip("Maximize / Restore")
+        self.max_button.setFixedSize(42, 30)
+        self.max_button.clicked.connect(window._toggle_maximize_restore)
+        layout.addWidget(self.max_button)
+
+        self.close_button = QToolButton()
+        self.close_button.setObjectName("closeButton")
+        self.close_button.setText("×")
+        self.close_button.setToolTip("Close")
+        self.close_button.setFixedSize(44, 30)
+        self.close_button.clicked.connect(window.close)
+        layout.addWidget(self.close_button)
+
+    def set_maximized(self, maximized):
+        self.max_button.setText("❐" if maximized else "□")
+        self.max_button.setToolTip("Restore" if maximized else "Maximize")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(event.position().toPoint())
+            if not isinstance(child, QToolButton):
+                self._drag_global_pos = event.globalPosition().toPoint()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_global_pos is not None and
+                event.buttons() & Qt.MouseButton.LeftButton):
+            if self._window.isMaximized():
+                # Restore before dragging, similar to a native Windows title bar.
+                ratio = max(0.05, min(0.95, event.position().x() / max(1, self.width())))
+                old_width = self._window.width()
+                self._window.showNormal()
+                new_x = int(event.globalPosition().x() - self._window.width() * ratio)
+                self._window.move(new_x, int(event.globalPosition().y() - 16))
+                self._drag_global_pos = event.globalPosition().toPoint()
+            else:
+                current = event.globalPosition().toPoint()
+                delta = current - self._drag_global_pos
+                self._window.move(self._window.pos() + delta)
+                self._drag_global_pos = current
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_global_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            child = self.childAt(event.position().toPoint())
+            if not isinstance(child, QToolButton):
+                self._window._toggle_maximize_restore()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+
+class TicketNotificationToast(QFrame):
+    """Persistent in-app alert for a newly detected live ticket."""
+    dismissed = pyqtSignal(str)
+
+    def __init__(self, record, parent=None):
+        super().__init__(parent)
+        self.record = dict(record or {})
+        self.ticket_id = self.record.get("ticket_id", "")
+        self.setObjectName("ticketNotificationToast")
+        self.setFixedWidth(430)
+        self.setMinimumHeight(170)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("""
+            QFrame#ticketNotificationToast {
+                background: rgba(255, 255, 255, 0.96);
+                border: 2px solid rgba(255, 98, 0, 0.90);
+                border-radius: 14px;
+            }
+            QLabel { background: transparent; color: #241912; }
+            QLabel#toastBadge {
+                color: #ffffff;
+                background: #FF6200;
+                border-radius: 7px;
+                padding: 4px 9px;
+                font-size: 9pt;
+                font-weight: 800;
+            }
+            QLabel#toastPriority {
+                color: #8A3210;
+                background: rgba(255, 98, 0, 0.10);
+                border: 1px solid rgba(255, 98, 0, 0.25);
+                border-radius: 7px;
+                padding: 3px 8px;
+                font-size: 9pt;
+                font-weight: 800;
+            }
+            QLabel#toastTicket {
+                color: #20150F;
+                font-size: 12pt;
+                font-weight: 800;
+            }
+            QLabel#toastMeta {
+                color: #665247;
+                font-size: 9.5pt;
+                font-weight: 600;
+            }
+            QLabel#toastDesc {
+                color: #34251D;
+                font-size: 10pt;
+                font-weight: 600;
+            }
+            QPushButton {
+                min-height: 28px;
+                border-radius: 7px;
+                padding: 5px 12px;
+                font-weight: 700;
+            }
+            QPushButton#toastOpen {
+                color: white;
+                background: #FF6200;
+                border: 1px solid #E84C00;
+            }
+            QPushButton#toastOpen:hover { background: #E84C00; }
+            QPushButton#toastDismiss {
+                color: #4B392F;
+                background: rgba(28, 20, 15, 0.05);
+                border: 1px solid rgba(28, 20, 15, 0.15);
+            }
+            QPushButton#toastDismiss:hover { background: rgba(28, 20, 15, 0.10); }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(7)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        badge = QLabel("NEW TICKET")
+        badge.setObjectName("toastBadge")
+        header.addWidget(badge, 0)
+        header.addStretch(1)
+        self.priority_label = QLabel()
+        self.priority_label.setObjectName("toastPriority")
+        header.addWidget(self.priority_label, 0)
+        layout.addLayout(header)
+
+        self.ticket_label = QLabel()
+        self.ticket_label.setObjectName("toastTicket")
+        self.ticket_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.ticket_label)
+
+        self.meta_label = QLabel()
+        self.meta_label.setObjectName("toastMeta")
+        self.meta_label.setWordWrap(True)
+        layout.addWidget(self.meta_label)
+
+        self.description_label = QLabel()
+        self.description_label.setObjectName("toastDesc")
+        self.description_label.setWordWrap(True)
+        layout.addWidget(self.description_label)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        self.open_button = QPushButton("Open Ticket")
+        self.open_button.setObjectName("toastOpen")
+        self.open_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_button.clicked.connect(self._open_ticket)
+        buttons.addWidget(self.open_button)
+        dismiss_button = QPushButton("Dismiss")
+        dismiss_button.setObjectName("toastDismiss")
+        dismiss_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        dismiss_button.clicked.connect(self.dismiss)
+        buttons.addWidget(dismiss_button)
+        layout.addLayout(buttons)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+        self._timer.start(15000)
+        self.update_record(record)
+
+        apply_soft_shadow(self, blur_radius=24, y_offset=5, alpha=55)
+
+    def update_record(self, record):
+        self.record = dict(record or {})
+        self.ticket_id = self.record.get("ticket_id", self.ticket_id)
+        priority = str(self.record.get("priority") or "Unknown").strip()
+        station = str(self.record.get("station") or "Unknown station").strip()
+        time_text = str(self.record.get("time") or "Time pending").strip()
+        description = str(self.record.get("description") or "Ticket details are loading...").strip()
+        if len(description) > 220:
+            description = description[:217].rstrip() + "..."
+
+        self.ticket_label.setText(self.ticket_id or "New ITMIS ticket")
+        self.priority_label.setText(priority.upper())
+        self.meta_label.setText(f"{station}  •  {time_text}")
+        self.description_label.setText(description)
+        self.open_button.setEnabled(bool(self.record.get("ticket_url")))
+        self.adjustSize()
+
+    def _open_ticket(self):
+        url = self.record.get("ticket_url", "")
+        if url:
+            webbrowser.open(url)
+        self.dismiss()
+
+    def dismiss(self):
+        if not self.isVisible():
+            return
+        self._timer.stop()
+        self.hide()
+        self.dismissed.emit(self.ticket_id)
+        self.deleteLater()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = Config()
+        self._always_on_top = self.config.settings.value("always_on_top", False, type=bool)
+        window_flags = self.windowFlags() | Qt.WindowType.FramelessWindowHint
+        if self._always_on_top:
+            window_flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(window_flags)
         self.scraper_thread = None
         self.live_monitor_thread = None
         self.config_dialog = None
@@ -2848,6 +3591,11 @@ class MainWindow(QMainWindow):
         self.live_monitor_status_messages = []
         self._lm_dupe_count = 0
         self.live_monitor_session_start = None
+        self.notification_tray = None
+        self._notification_toasts = {}
+        self._notification_toast_order = []
+        self._notified_ticket_ids = set()
+        self._last_notification_record = None
         self._live_monitor_session_path = os.path.join(
             os.environ.get("LOCALAPPDATA", os.getcwd()),
             "ITMIS_Ticket_Scraper",
@@ -2865,6 +3613,7 @@ class MainWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self.init_ui()
+        self._setup_notification_system()
         enable_acrylic_blur(self, tint_rgba=(255, 255, 255, 10))
         self.init_live_monitor()
 
@@ -2893,7 +3642,7 @@ class MainWindow(QMainWindow):
 
         
     def init_ui(self):
-        self.setWindowTitle("ITMIS Ticket Scraper v2.0")
+        self.setWindowTitle("ITMIS Ticket Scraper")
         self.setMinimumSize(1000, 780)
         self.resize(1120, 960)
 
@@ -3058,6 +3807,15 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(main_widget)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
+
+        # ── Window border/title bar ─────────────────────────────
+        # Frameless title bar lets us place the persistent Pin control directly
+        # beside Minimize while retaining normal Minimize/Maximize/Close actions.
+        self.custom_title_bar = CustomTitleBar(self)
+        root_layout.addWidget(self.custom_title_bar)
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setToolTip("Drag to resize")
+        self.size_grip.raise_()
 
         # ── Header banner ──────────────────────────────────────
         header = QWidget()
@@ -3225,6 +3983,203 @@ class MainWindow(QMainWindow):
         self.log(f"Configuration loaded — Max retries: {self.config.MAX_RETRIES}, Delay: {self.config.DELAY_BETWEEN_TICKETS}s")
 
 
+
+    def _toggle_maximize_restore(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        if hasattr(self, "custom_title_bar"):
+            self.custom_title_bar.set_maximized(self.isMaximized())
+
+    def _toggle_always_on_top(self, enabled):
+        """Toggle top-most state while preserving size/maximized state."""
+        enabled = bool(enabled)
+        if enabled == self._always_on_top:
+            return
+        self._always_on_top = enabled
+        self.config.settings.setValue("always_on_top", enabled)
+
+        was_maximized = self.isMaximized()
+        old_geometry = self.geometry()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        self.show()
+        if was_maximized:
+            self.showMaximized()
+        else:
+            self.setGeometry(old_geometry)
+        if enabled:
+            self.raise_()
+            self.activateWindow()
+
+        # setWindowFlag can recreate the native HWND; restore the acrylic effect.
+        QTimer.singleShot(0, lambda: enable_acrylic_blur(self, tint_rgba=(255, 255, 255, 10)))
+
+    def _setup_notification_system(self):
+        """Create OS + in-app notification channels for new live tickets."""
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return
+            self.notification_tray = QSystemTrayIcon(self)
+            icon = self.windowIcon()
+            if not icon.isNull():
+                self.notification_tray.setIcon(icon)
+            self.notification_tray.setToolTip("ITMIS Ticket Scraper — Live Monitor")
+            self.notification_tray.messageClicked.connect(self._on_notification_message_clicked)
+            self.notification_tray.activated.connect(self._on_tray_activated)
+            self.notification_tray.show()
+        except Exception:
+            self.notification_tray = None
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._bring_window_to_front(show_live_monitor=True)
+
+    def _on_notification_message_clicked(self):
+        """Bring the operator straight to Live Monitor when the OS alert is clicked."""
+        self._bring_window_to_front(show_live_monitor=True)
+
+    def _bring_window_to_front(self, show_live_monitor=False):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        if show_live_monitor and hasattr(self, "main_tabs") and hasattr(self, "live_monitor_tab"):
+            self.main_tabs.setCurrentWidget(self.live_monitor_tab)
+        self.raise_()
+        self.activateWindow()
+
+    def _play_new_ticket_sound(self):
+        """Two short alert tones without blocking the live-monitor worker."""
+        try:
+            QApplication.beep()
+            QTimer.singleShot(220, QApplication.beep)
+        except Exception:
+            pass
+
+    def _on_ticket_toast_dismissed(self, ticket_id):
+        toast = self._notification_toasts.pop(ticket_id, None)
+        if ticket_id in self._notification_toast_order:
+            self._notification_toast_order.remove(ticket_id)
+        self._reposition_notification_toasts()
+
+    def _show_ticket_toast(self, record):
+        """Show a persistent, actionable alert inside the application."""
+        ticket_id = record.get("ticket_id", "")
+        if not ticket_id:
+            return
+
+        existing = self._notification_toasts.get(ticket_id)
+        if existing is not None:
+            existing.update_record(record)
+            existing.show()
+            existing.raise_()
+            self._reposition_notification_toasts()
+            return
+
+        toast = TicketNotificationToast(record, self)
+        toast.dismissed.connect(self._on_ticket_toast_dismissed)
+        self._notification_toasts[ticket_id] = toast
+        self._notification_toast_order.append(ticket_id)
+
+        # Keep the newest three alerts visible so a burst of tickets remains readable.
+        while len(self._notification_toast_order) > 3:
+            oldest_id = self._notification_toast_order[0]
+            oldest = self._notification_toasts.get(oldest_id)
+            if oldest is not None:
+                oldest.dismiss()
+            else:
+                self._notification_toast_order.pop(0)
+
+        toast.show()
+        toast.raise_()
+        self._reposition_notification_toasts()
+
+    def _update_ticket_notification(self, record):
+        """Upgrade the visible in-app alert when full ticket details arrive."""
+        ticket_id = record.get("ticket_id", "")
+        toast = self._notification_toasts.get(ticket_id)
+        if toast is not None:
+            toast.update_record(record)
+            toast.raise_()
+            self._reposition_notification_toasts()
+
+    def _reposition_notification_toasts(self):
+        if not self._notification_toast_order:
+            return
+        top_margin = 14
+        if hasattr(self, "custom_title_bar"):
+            top_margin += max(0, self.custom_title_bar.height())
+        y = top_margin
+        right_margin = 16
+        for ticket_id in list(self._notification_toast_order):
+            toast = self._notification_toasts.get(ticket_id)
+            if toast is None:
+                continue
+            toast.adjustSize()
+            x = max(8, self.width() - toast.width() - right_margin)
+            toast.move(x, y)
+            toast.raise_()
+            y += toast.height() + 10
+
+    def _show_new_ticket_notification(self, record):
+        """Issue one strong alert per new ticket, immediately on dashboard detection."""
+        ticket_id = record.get("ticket_id", "New ticket")
+        if ticket_id in self._notified_ticket_ids:
+            self._update_ticket_notification(record)
+            return
+        self._notified_ticket_ids.add(ticket_id)
+        self._last_notification_record = dict(record or {})
+
+        station = record.get("station", "Unknown station") or "Unknown station"
+        time_text = record.get("time", "") or ""
+        priority = str(record.get("priority", "Unknown") or "Unknown").strip()
+        description = (record.get("description", "") or "").strip()
+        if len(description) > 160:
+            description = description[:157].rstrip() + "..."
+
+        body_parts = [part for part in (station, time_text, f"Priority: {priority}") if part]
+        body = " • ".join(body_parts)
+        if description:
+            body = f"{body}\n{description}" if body else description
+
+        priority_upper = priority.upper()
+        prefix = "🚨" if priority_upper in {"CRITICAL", "HIGH"} else "🔔"
+
+        self._show_ticket_toast(record)
+        self._play_new_ticket_sound()
+        try:
+            QApplication.alert(self, 7000)
+        except Exception:
+            pass
+
+        try:
+            if self.notification_tray and self.notification_tray.isVisible():
+                self.notification_tray.showMessage(
+                    f"{prefix} New ITMIS Ticket — {ticket_id}",
+                    body or "A new live ticket was detected.",
+                    QSystemTrayIcon.MessageIcon.Warning
+                    if priority_upper in {"CRITICAL", "HIGH"}
+                    else QSystemTrayIcon.MessageIcon.Information,
+                    12000,
+                )
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "size_grip"):
+            self.size_grip.move(
+                max(0, self.width() - self.size_grip.sizeHint().width()),
+                max(0, self.height() - self.size_grip.sizeHint().height()),
+            )
+            self.size_grip.raise_()
+        if hasattr(self, "_notification_toasts"):
+            self._reposition_notification_toasts()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "custom_title_bar"):
+            self.custom_title_bar.set_maximized(self.isMaximized())
 
     def create_config_section(self):
         """Create configuration preview section"""
@@ -5887,32 +6842,34 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._debug_log_file = None
 
-        self.live_monitor_thread = LiveMonitorThread(self.config)
+        self.live_monitor_thread = LiveMonitorThread(
+            self.config, session_start=self.live_monitor_session_start
+        )
         self.live_monitor_thread.status_update.connect(self.on_live_monitor_status)
         self.live_monitor_thread.ticket_captured.connect(self.on_live_monitor_ticket_captured)
         self.live_monitor_thread.duplicate_detected.connect(self.on_live_monitor_duplicate)
         self.live_monitor_thread.error_occurred.connect(self.on_live_monitor_error)
         self.live_monitor_thread.monitoring_stopped.connect(self.on_live_monitor_stopped)
         self.live_monitor_thread.monitor_stats.connect(self.on_live_monitor_stats)
-        pending_reextract = []
+        restored_preliminary_count = 0
         for t in self.live_monitor_tickets:
             tid = t.get("ticket_id")
             url = t.get("ticket_url")
-            if t.get("preliminary"):
-                # Incomplete record left over from a previous session (dashboard-row or
-                # notification placeholder that never got upgraded to full ticket-page details).
-                # Don't mark it processed — queue it so the thread re-opens and re-extracts it.
-                if tid and url:
-                    pending_reextract.append((tid, url))
-                continue
             if tid:
+                # Every restored ticket, including an old preliminary record, is
+                # considered pre-existing for this new monitoring session.
                 self.live_monitor_thread._processed_ids.add(tid)
+                self.live_monitor_thread._baseline_ticket_ids.add(tid)
             if url:
                 self.live_monitor_thread.processed_urls.add(url)
-        self.live_monitor_thread.pending_reextract = pending_reextract
-        if pending_reextract:
+            if t.get("preliminary"):
+                restored_preliminary_count += 1
+
+        self.live_monitor_thread.pending_reextract = []
+        if restored_preliminary_count:
             self._lm_append_status(
-                f"{len(pending_reextract)} restored ticket(s) are missing full details and will be re-fetched on start."
+                f"{restored_preliminary_count} restored preliminary ticket(s) kept as history "
+                "and will not be automatically re-fetched in this session."
             )
         self.live_monitor_thread.start()
         self.main_tabs.setCurrentWidget(self.live_monitor_tab)
@@ -5983,6 +6940,7 @@ class MainWindow(QMainWindow):
                 )
                 self._lm_update_summary()
                 self.persist_live_monitor_session()
+                self._update_ticket_notification(record)
                 return
         
         # Check for duplicate (non-preliminary)
@@ -5999,6 +6957,7 @@ class MainWindow(QMainWindow):
         )
         self._lm_update_summary()
         self.persist_live_monitor_session()
+        self._show_new_ticket_notification(record)
 
     def on_live_monitor_duplicate(self, ticket_id):
         self._lm_dupe_count += 1
@@ -6229,23 +7188,59 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(80, self._lm_scroll_feed_to_bottom)
 
     def _lm_scroll_feed_to_bottom(self):
-        bar = self.lm_feed_scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        try:
+            bar = self.lm_feed_scroll.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        except RuntimeError:
+            # Window/feed may have been closed before the short delayed scroll fires.
+            pass
+
+    def _safe_widget_set_style(self, widget, stylesheet):
+        """Set a QWidget stylesheet only if its Qt object is still alive.
+
+        Live-monitor cards are intentionally replaced when a preliminary dashboard
+        record is upgraded with full ticket details.  A QTimer.singleShot created
+        by the old card can therefore fire after deleteLater() has destroyed the
+        underlying C++ object.  PyQt keeps the Python wrapper around long enough
+        for that delayed callback to run, which otherwise raises:
+            RuntimeError: wrapped C/C++ object ... has been deleted
+        """
+        try:
+            if widget is not None:
+                widget.setStyleSheet(stylesheet)
+        except RuntimeError:
+            # The widget was removed/replaced before the delayed UI reset fired.
+            # This is expected during preliminary -> full-detail card upgrades.
+            pass
+
+    def _safe_widget_set_text(self, widget, text):
+        """Set button/label text without crashing if its Qt object was deleted."""
+        try:
+            if widget is not None:
+                widget.setText(text)
+        except RuntimeError:
+            pass
 
     def flash_live_monitor_card(self, card, duplicate=False):
-        card.setStyleSheet(_LM_CARD_DUPE_FLASH if duplicate else _LM_CARD_NEW_FLASH)
-        QTimer.singleShot(1600, lambda: card.setStyleSheet(_LM_CARD_DEFAULT))
+        self._safe_widget_set_style(
+            card, _LM_CARD_DUPE_FLASH if duplicate else _LM_CARD_NEW_FLASH
+        )
+        # Never call card.setStyleSheet directly from a delayed lambda: the
+        # preliminary card may have been replaced by the full-detail card first.
+        QTimer.singleShot(1600, lambda c=card: self._safe_widget_set_style(c, _LM_CARD_DEFAULT))
 
     def _on_copy_clicked(self, btn, text):
         QApplication.clipboard().setText(text)
-        btn.setText("✓  Copied")
-        QTimer.singleShot(1500, lambda: btn.setText("📋  Copy"))
+        self._safe_widget_set_text(btn, "✓  Copied")
+        # The ticket card (and this button) can be replaced while the timer waits.
+        QTimer.singleShot(1500, lambda b=btn: self._safe_widget_set_text(b, "📋  Copy"))
 
     def _copy_all_tickets(self):
         all_text = "\n".join(r.get("formatted_statement", "") for r in self.live_monitor_tickets)
         QApplication.clipboard().setText(all_text)
-        self.lm_copy_all_btn.setText("✓  All Copied")
-        QTimer.singleShot(1600, lambda: self.lm_copy_all_btn.setText("📋  Copy All"))
+        btn = self.lm_copy_all_btn
+        self._safe_widget_set_text(btn, "✓  All Copied")
+        QTimer.singleShot(1600, lambda b=btn: self._safe_widget_set_text(b, "📋  Copy All"))
 
     def remove_live_monitor_card(self, ticket_id):
         card = self.live_monitor_card_widgets.pop(ticket_id, None)
@@ -6411,10 +7406,14 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 self.scraper_thread.stop()
                 self.scraper_thread.wait(3000)
+                if self.notification_tray:
+                    self.notification_tray.hide()
                 event.accept()
             else:
                 event.ignore()
         else:
+            if self.notification_tray:
+                self.notification_tray.hide()
             event.accept()
 
 if __name__ == "__main__":
