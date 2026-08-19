@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 import psutil
 import time
 from threading import Event, Lock, Thread
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                           QHBoxLayout, QPushButton, QLabel, QProgressBar, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                           QHBoxLayout, QPushButton, QLabel, QProgressBar,
                            QFileDialog, QTextEdit, QFrame, QSplitter, QSpinBox,
                            QCheckBox, QGroupBox, QGridLayout, QLineEdit, QComboBox,
                            QMessageBox, QTabWidget, QFormLayout, QToolBar,
@@ -33,13 +33,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, UnexpectedAlertPresentException, WebDriverException
 
-# EXE (PyInstaller) reliability: ensure webdriver-manager + Selenium Manager caches land in a writable location
 if getattr(sys, "frozen", False):
     _app_cache_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.getcwd()), "ITMIS_Ticket_Scraper")
     os.makedirs(_app_cache_dir, exist_ok=True)
     os.environ.setdefault("WDM_LOCAL", "1")
     os.environ.setdefault("WDM_CACHE_DIR", os.path.join(_app_cache_dir, "wdm_cache"))
-    # Selenium Manager cache directory (Selenium 4.6+)
     os.environ.setdefault("SE_CACHE_PATH", os.path.join(_app_cache_dir, "selenium_cache"))
 
 
@@ -51,15 +49,6 @@ def apply_soft_shadow(widget: QWidget, blur_radius: int = 28, y_offset: int = 4,
     effect.setColor(QColor(0, 0, 0, alpha))
     widget.setGraphicsEffect(effect)
 
-
-# ── Real window transparency + native OS blur-behind (Glassmorphism) ─────
-# QSS alone can only fake glass with translucent colors; actual "see-through
-# blur" requires the OS compositor. On Windows 10/11 we hook the undocumented
-# SetWindowCompositionAttribute API to turn the window's real backdrop
-# (desktop / whatever is behind it) into a blurred acrylic surface. On other
-# platforms this silently no-ops and the window falls back to true alpha
-# transparency (WA_TranslucentBackground) without the blur.
-
 def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
     """Windows: try the modern DWM backdrop API (Win11 22H2+ Mica/Acrylic)
     first, then fall back to the undocumented but battle-tested
@@ -69,18 +58,16 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
 
     hwnd = wintypes.HWND(int(widget.winId()))
 
-    # -- Attempt 1: DWM system backdrop (clean, first-party, Win11 22H2+) --
     try:
         dwmapi = ctypes.windll.dwmapi
         DWMWA_SYSTEMBACKDROP_TYPE = 38
-        DWMSBT_TRANSIENTWINDOW = 3  # acrylic-style backdrop
+        DWMSBT_TRANSIENTWINDOW = 3
         backdrop = ctypes.c_int(DWMSBT_TRANSIENTWINDOW)
         hr = dwmapi.DwmSetWindowAttribute(
             hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
             ctypes.byref(backdrop), ctypes.sizeof(backdrop)
         )
-        # Extend the frame into the client area so the backdrop paints
-        # behind the whole window, not just a native titlebar strip.
+
         if hr == 0:
             class MARGINS(ctypes.Structure):
                 _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
@@ -88,9 +75,6 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
             margins = MARGINS(-1, -1, -1, -1)
             dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
 
-            # Keep the title bar light regardless of the user's system
-            # theme, so it stays a soft light glass strip rather than
-            # switching to a dark bar that clashes with the light panels.
             try:
                 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
                 use_dark = ctypes.c_int(0)
@@ -101,18 +85,10 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
             except Exception:
                 pass
 
-            # Without this, DWM paints the native caption strip (where the
-            # minimize/maximize/close buttons live) and the 1px window
-            # border with the user's Windows accent color, right on top of
-            # the acrylic backdrop we just set - so the title bar shows up
-            # as a solid accent-colored band instead of glass, even though
-            # the rest of the window is blurred. DWMWA_COLOR_NONE tells DWM
-            # to skip that accent paint so the backdrop material shows
-            # through the caption area too.
             try:
                 DWMWA_BORDER_COLOR = 34
                 DWMWA_CAPTION_COLOR = 35
-                DWMWA_COLOR_NONE = ctypes.c_int(-2)  # 0xFFFFFFFE
+                DWMWA_COLOR_NONE = ctypes.c_int(-2)
                 dwmapi.DwmSetWindowAttribute(
                     hwnd, DWMWA_CAPTION_COLOR,
                     ctypes.byref(DWMWA_COLOR_NONE), ctypes.sizeof(DWMWA_COLOR_NONE)
@@ -127,7 +103,6 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
     except Exception:
         pass
 
-    # -- Attempt 2: legacy accent-policy blur (older Win10) --
     try:
         class ACCENT_POLICY(ctypes.Structure):
             _fields_ = [
@@ -145,7 +120,7 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
             ]
 
         r, g, b, a = tint_rgba
-        gradient_color = (a << 24) | (b << 16) | (g << 8) | r  # AABBGGRR
+        gradient_color = (a << 24) | (b << 16) | (g << 8) | r
 
         accent = ACCENT_POLICY()
         accent.AccentFlags = 2
@@ -153,11 +128,11 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
         accent.AnimationId = 0
 
         data = WINDOWCOMPOSITIONATTRIBDATA()
-        data.Attribute = 19  # WCA_ACCENT_POLICY
+        data.Attribute = 19
         data.SizeOfData = ctypes.sizeof(accent)
 
         set_attr = ctypes.windll.user32.SetWindowCompositionAttribute
-        for accent_state in (4, 3):  # 4 = ACRYLIC blur, 3 = plain gaussian blur (older Win10)
+        for accent_state in (4, 3):
             accent.AccentState = accent_state
             data.Data = ctypes.pointer(accent)
             if set_attr(hwnd, ctypes.pointer(data)):
@@ -165,7 +140,6 @@ def _enable_acrylic_blur_windows(widget: QWidget, tint_rgba) -> bool:
         return False
     except Exception:
         return False
-
 
 def _enable_acrylic_blur_macos(widget: QWidget, tint_rgba) -> bool:
     """macOS: drop a real NSVisualEffectView (the same frosted-glass layer
@@ -196,11 +170,9 @@ def _enable_acrylic_blur_macos(widget: QWidget, tint_rgba) -> bool:
             caller = ctypes.cast(fn, proto)
             return caller(receiver, selector, *args)
 
-        # NSView backing this Qt window, and its NSWindow.
         nsview = ctypes.c_void_p(int(widget.winId()))
         nswindow = send(nsview, sel("window"))
 
-        # Frame = the content view's bounds.
         content_view = send(nswindow, sel("contentView"))
 
         class NSRect(ctypes.Structure):
@@ -214,9 +186,7 @@ def _enable_acrylic_blur_macos(widget: QWidget, tint_rgba) -> bool:
 
         NSVisualEffectBlendingModeBehindWindow = 0
         NSVisualEffectStateActive = 1
-        # HUDWindow renders as a dark control-panel material — wrong for a
-        # light, airy glass look. Popover is a light, high-blur frosted
-        # material (the same one macOS uses for light popovers/panels).
+
         NSVisualEffectMaterialPopover = 9
 
         send(effect_view, sel("setMaterial:"), ctypes.c_long(NSVisualEffectMaterialPopover),
@@ -231,13 +201,9 @@ def _enable_acrylic_blur_macos(widget: QWidget, tint_rgba) -> bool:
              restype=None, argtypes=[ctypes.c_ulong])
 
         send(content_view, sel("addSubview:positioned:relativeTo:"),
-             effect_view, ctypes.c_long(-1), ctypes.c_void_p(0),  # NSWindowBelow
+             effect_view, ctypes.c_long(-1), ctypes.c_void_p(0),
              restype=None, argtypes=[ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p])
 
-        # Force a light appearance on the window itself so the frosted
-        # material (and every rgba(255,255,255,...) glass panel painted on
-        # top of it) always renders as light glass, regardless of the
-        # user's system-wide dark mode setting.
         try:
             nsstring_cls = cls("NSString")
             name = send(nsstring_cls, sel("stringWithUTF8String:"),
@@ -256,7 +222,6 @@ def _enable_acrylic_blur_macos(widget: QWidget, tint_rgba) -> bool:
         return True
     except Exception:
         return False
-
 
 def enable_acrylic_blur(widget: QWidget, tint_rgba=(255, 255, 255, 1)) -> bool:
     """
@@ -282,19 +247,14 @@ def enable_acrylic_blur(widget: QWidget, tint_rgba=(255, 255, 255, 1)) -> bool:
         return _enable_acrylic_blur_windows(widget, tint_rgba)
     if sys.platform == "darwin":
         return _enable_acrylic_blur_macos(widget, tint_rgba)
-
-    # Linux: no portable blur-behind API. Compositors that support it
-    # (KWin, some Mutter builds with a blur extension) will blur a
-    # WA_TranslucentBackground window automatically — nothing more to do.
     return False
 
-# Ticket validation and link generation functions (from Chrome extension)
 TICKET_REGEX = re.compile(r'^[A-Z]{2,5}\.[A-Z0-9]{2,8}\.\d{4}\.\d{2}\.\d{6,10}$', re.IGNORECASE)
-TICKET_REGEX_PARTIAL = re.compile(r'\d{4}\.\d{2}\.\d{6,10}', re.IGNORECASE)  # For partial ticket numbers like 2026.08.00276483
+TICKET_REGEX_PARTIAL = re.compile(r'\d{4}\.\d{2}\.\d{6,10}', re.IGNORECASE)
 LIVE_MONITOR_TICKET_URL_RE = re.compile(r'service-tickets/details/([^/?#]+)', re.IGNORECASE)
 LIVE_MONITOR_TIME_RE = re.compile(r'\d{1,2}:\d{2}(:\d{2})?\s*[AP]M', re.IGNORECASE)
 
-# ── Pure Glassmorphism tokens ─────────────────────────────────────────────
+
 GLASS_BG          = "rgba(255, 255, 255, 0.13)"
 GLASS_BG_HOVER    = "rgba(255, 255, 255, 0.20)"
 GLASS_BORDER      = "1px solid rgba(255, 255, 255, 0.32)"
@@ -318,14 +278,6 @@ _LM_CARD_NEW_FLASH = """
     }
 """
 
-# ── Glass-themed QMessageBox (matches ConfigDialog's palette) ─────────────
-# QMessageBox is opened all over the app via the static convenience methods
-# (QMessageBox.information/warning/critical/question). Those create their own
-# top-level dialog under the hood, so a per-widget stylesheet on the calling
-# window won't reliably reach them. Instead we style QMessageBox once, at the
-# QApplication level, and pair it with real acrylic blur-behind so every
-# popup in the app - including the ones raised from ConfigDialog - reads as
-# part of the same frosted-glass UI instead of a plain native dialog.
 GLASS_MESSAGEBOX_QSS = """
     QMessageBox {
         background: rgba(255, 255, 255, 0.20);
@@ -371,7 +323,6 @@ GLASS_MESSAGEBOX_QSS = """
     }
 """
 
-
 class GlassDialogBlurFilter(QObject):
     """App-wide event filter that gives every QMessageBox real OS
     blur-behind (acrylic/vibrancy) the moment it's shown, so popups raised
@@ -384,12 +335,6 @@ class GlassDialogBlurFilter(QObject):
             if not obj.property("_glass_blur_applied"):
                 obj.setProperty("_glass_blur_applied", True)
                 enable_acrylic_blur(obj)
-                # Some callers open a QMessageBox with a parent (e.g.
-                # ConfigDialog) whose own generic "QWidget {...}" rule would
-                # otherwise win over the app-level QMessageBox style, since
-                # widget-level stylesheets in the ancestor chain take
-                # precedence over qApp's. Re-applying the glass QSS directly
-                # on the box itself guarantees it always renders correctly.
                 obj.setStyleSheet(GLASS_MESSAGEBOX_QSS)
         return False
 
@@ -418,7 +363,7 @@ _LM_STATUS_ACTIVE = """
     }
 """
 
-# Buttons – keep color only on primary actions, everything else is glass
+
 BTN_PRIMARY = f"""
     QPushButton {{
         background: rgba(255, 98, 0, 0.75);
@@ -522,49 +467,49 @@ BTN_FILTER_ALL = f"""
 
 def is_valid_ticket(ticket: str) -> tuple:
     """Check if a ticket number matches the valid format.
-    
+
     Returns:
         tuple: (is_valid: bool, error_message: str)
     """
     ticket = ticket.strip().upper()
-    
+
     if not TICKET_REGEX.match(ticket):
         return (False, "Invalid format: Expected format LHR.L2SP.YYYY.MM.XXXXXXXX")
-    
-    # Additional validation: check each segment
+
+
     segments = ticket.split('.')
-    
+
     if len(segments) != 5:
         return (False, f"Invalid format: Expected 5 segments, got {len(segments)}")
-    
-    # Validate location code (segment 0)
+
+
     if not segments[0].isalpha() or len(segments[0]) < 2 or len(segments[0]) > 5:
         return (False, f"Invalid location code: '{segments[0]}' - Must be 2-5 letters")
-    
-    # Validate line/system code (segment 1)
+
+
     if not segments[1].isalnum() or len(segments[1]) < 2 or len(segments[1]) > 8:
         return (False, f"Invalid line/system code: '{segments[1]}' - Must be 2-8 alphanumeric characters")
-    
-    # Validate year (segment 2)
+
+
     try:
         year = int(segments[2])
         if year < 2000 or year > 2099:
             return (False, f"Invalid year: '{segments[2]}' - Must be between 2000-2099")
     except ValueError:
         return (False, f"Invalid year: '{segments[2]}' - Must be 4 digits")
-    
-    # Validate month (segment 3)
+
+
     try:
         month = int(segments[3])
         if month < 1 or month > 12:
             return (False, f"Invalid month: '{segments[3]}' - Must be between 01-12")
     except ValueError:
         return (False, f"Invalid month: '{segments[3]}' - Must be 2 digits")
-    
-    # Validate reference number (segment 4)
+
+
     if not segments[4].isdigit() or len(segments[4]) < 6 or len(segments[4]) > 10:
         return (False, f"Invalid reference number: '{segments[4]}' - Must be 6-10 digits")
-    
+
     return (True, "")
 
 def make_link(ticket: str, base_url: str) -> str:
@@ -594,34 +539,34 @@ class Config:
     def __init__(self):
         self.settings = QSettings("TicketScraper", "Settings")
         self.load_defaults()
-    
+
     def load_defaults(self):
         """Load default configuration values"""
         self.LOGIN_URL = self.settings.value("login_url", "https://itmis.olmrts.com.pk/#/login")
         self.DASHBOARD_URL = self.settings.value("dashboard_url", "https://itmis.olmrts.com.pk/#/app/dashboard")
         self.BASE_TICKET_URL = self.settings.value("base_ticket_url", "https://itmis.olmrts.com.pk/#/app/service-tickets/details/")
         self.LAST_FILE_PATH = self.settings.value("last_file_path", "")
-        
-        # Timing settings (optimized for speed)
+
+
         self.LOGIN_TIMEOUT = int(self.settings.value("login_timeout", 30))
         self.PAGE_LOAD_TIMEOUT = int(self.settings.value("page_load_timeout", 15))
         self.ELEMENT_WAIT_TIMEOUT = int(self.settings.value("element_wait_timeout", 5))
         self.DELAY_BETWEEN_TICKETS = int(self.settings.value("delay_between_tickets", 1))
-        
-        # Retry settings
+
+
         self.MAX_RETRIES = int(self.settings.value("max_retries", 3))
         self.RETRY_DELAY = int(self.settings.value("retry_delay", 5))
-        
-        # Chrome settings
+
+
         self.CHROME_BINARY_PATH = self.settings.value("chrome_binary", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
         self.HEADLESS_MODE = self.settings.value("headless_mode", False, type=bool)
-        
-        # Content analysis settings
+
+
         raw_keywords = self.settings.value("keyword_list", "") or ""
         self.KEYWORD_LIST = [
             kw.strip() for kw in str(raw_keywords).split(",") if kw.strip()
         ]
-        # XPath settings
+
         self.CONTENT_XPATH = '/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/div/section[1]/div[2]/p'
         self.COMMENT_XPATH = '/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/div/section[2]/div/div/ul'
         self.STATION_XPATH = '/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/aside/section[1]/div/div[2]/span[2]'
@@ -630,15 +575,15 @@ class Config:
         self.RESOLVED_DATETIME_XPATH = '/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/aside/section[2]/div/div[4]/span[2]'
         self.TICKET_CATEGORY_XPATH = '/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/aside/section[1]/div/div[1]/span[2]'
         self.LAST_COMMENT_TIME_XPATH = '/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/div/section[2]/div/div/ul/li/div/span'
-        
-        # Live Monitor Dashboard XPaths
+
+
         self.DASHBOARD_FIRST_TICKET_XPATH = '/html/body/app-root/app-init-app/div/div/app-dashboard/div/div[4]/div/div/div/p-scrollpanel/div/div[1]/div/p-table/div/div/table/tbody/tr[1]'
         self.NOTIFICATION_BELL_ICON_XPATH = '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/a/em'
         self.NOTIFICATION_BELL_DROPDOWN_XPATH = '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/div'
         self.NOTIFICATION_COUNT_XPATH = '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/div/div[1]/span/span'
         self.NOTIFICATION_TICKET_NUMBER_XPATH = '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/div/div[2]/a[1]/div/div[1]/span[1]'
         self.NOTIFICATION_LINK_XPATH = '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/div/div[2]/a[1]'
-        
+
     def save_settings(self):
         """Save current configuration"""
         self.settings.setValue("login_url", self.LOGIN_URL)
@@ -668,8 +613,8 @@ class ScraperThread(QThread):
     log = pyqtSignal(str)
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
-    validation_errors = pyqtSignal(list)   # list of (ticket, error_msg) tuples
-    
+    validation_errors = pyqtSignal(list)
+
     def __init__(self, links_file, config):
         super().__init__()
         self.links_file = links_file
@@ -679,7 +624,7 @@ class ScraperThread(QThread):
         self.results = []
         self.current_ticket = 0
         self.start_time = None
-        
+
     def stop(self):
         """Stop the scraping process"""
         self.is_running = False
@@ -693,30 +638,30 @@ class ScraperThread(QThread):
         try:
             if not self.is_running:
                 return
-                
-            # NOTE: We no longer kill existing Chrome processes automatically.
-            # If you want to force-close Chrome/ChromeDriver, call kill_chrome_processes() manually.
+
+
+
             self.log.emit("Starting Chrome setup without closing existing Chrome instances...")
-            
-            # Setup Chrome
+
+
             if not self.setup_chrome():
                 self.error.emit("Failed to setup Chrome browser")
                 return
-            
-            # Login first
+
+
             if not self.login():
                 self.error.emit("Failed to login to the system")
                 return
-            
-            # Read links from file
+
+
             if not self.read_links_file():
                 self.error.emit("Failed to read links from file")
                 return
-            
-            # Process each link
+
+
             self.process_all_links()
-            
-            # Save results
+
+
             if self.results:
                 self.save_results(self.results)
                 self.log.emit("Scraping completed successfully!")
@@ -724,7 +669,7 @@ class ScraperThread(QThread):
             else:
                 self.log.emit("No results to save.")
                 self.finished.emit([])
-            
+
         except Exception as e:
             self.log.emit(f"Critical error: {str(e)}")
             self.error.emit(f"Critical error: {str(e)}")
@@ -743,13 +688,13 @@ class ScraperThread(QThread):
                         killed_count += 1
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
-            
+
             if killed_count > 0:
                 self.log.emit(f"Killed {killed_count} Chrome processes")
-                time.sleep(1)  # Wait for processes to fully terminate
+                time.sleep(1)
             else:
                 self.log.emit("No Chrome processes found to kill.")
-                
+
         except Exception as e:
             self.log.emit(f"Warning: Could not clean Chrome processes: {str(e)}")
 
@@ -795,7 +740,7 @@ class ScraperThread(QThread):
             profile_dir = os.path.join(base_dir, "chrome_profile")
             os.makedirs(profile_dir, exist_ok=True)
 
-            # --- Attempt 1: Selenium Manager (no explicit driver path) ---
+
             self.log.emit("Using Selenium Manager for automatic ChromeDriver management...")
             for attempt, p_dir in enumerate([profile_dir, None], start=1):
                 try:
@@ -803,8 +748,8 @@ class ScraperThread(QThread):
                         p_dir if p_dir else os.path.join(base_dir, f"chrome_profile_tmp_{attempt}")
                     )
                     if p_dir is None:
-                        # Omit --user-data-dir entirely so Chrome uses a fresh temp profile,
-                        # avoiding "renderer disconnected" crashes caused by a locked profile.
+
+
                         args = [a for a in opts.arguments if not a.startswith("--user-data-dir") and not a.startswith("--profile-directory")]
                         opts.arguments.clear()
                         for a in args:
@@ -820,13 +765,13 @@ class ScraperThread(QThread):
 
             self.log.emit(f"Selenium Manager failed: {last_err}")
 
-            # --- Attempt 2: webdriver-manager fallback ---
+
             self.log.emit("Falling back to webdriver-manager...")
             try:
                 driver_path = ChromeDriverManager().install()
 
-                # WinError 193 guard: webdriver-manager sometimes returns a path to a
-                # LICENSES text file or a zip instead of chromedriver.exe.
+
+
                 if not driver_path.lower().endswith(".exe"):
                     import glob
                     exe_candidates = glob.glob(
@@ -849,7 +794,7 @@ class ScraperThread(QThread):
             except Exception as e:
                 self.log.emit(f"webdriver-manager fallback failed: {e}")
 
-            # --- Attempt 3: chromedriver.exe already on PATH ---
+
             self.log.emit("Trying chromedriver from system PATH...")
             import shutil
             path_driver = shutil.which("chromedriver") or shutil.which("chromedriver.exe")
@@ -874,19 +819,19 @@ class ScraperThread(QThread):
             try:
                 if not self.is_running:
                     return False
-                
+
                 self.log.emit(f"Login attempt {attempt + 1}/{self.config.MAX_RETRIES}")
                 self.driver.get(self.config.LOGIN_URL)
-                
+
                 self.log.emit("Please enter login credentials and press Sign In")
                 self.log.emit("Waiting for successful login...")
-                
-                # Wait for dashboard element that proves successful login
+
+
                 WebDriverWait(self.driver, self.config.LOGIN_TIMEOUT).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "app-dashboard"))
                 )
-                
-                # Verify login by checking for user session
+
+
                 try:
                     user_info = self.driver.execute_script("return localStorage.getItem('user');")
                     if user_info:
@@ -895,22 +840,22 @@ class ScraperThread(QThread):
                         self.log.emit("Warning: Could not verify user session")
                 except Exception as e:
                     self.log.emit(f"Could not access localStorage: {str(e)}")
-                
-                time.sleep(1)  # Allow session to fully initialize
+
+                time.sleep(1)
                 self.log.emit("Login successful, ready for ticket processing...")
                 return True
-                
+
             except TimeoutException:
                 self.log.emit(f"Login timeout on attempt {attempt + 1}")
                 if attempt < self.config.MAX_RETRIES - 1:
                     self.log.emit(f"Retrying in {self.config.RETRY_DELAY} seconds...")
                     time.sleep(self.config.RETRY_DELAY)
-                
+
             except Exception as e:
                 self.log.emit(f"Login error on attempt {attempt + 1}: {str(e)}")
                 if attempt < self.config.MAX_RETRIES - 1:
                     time.sleep(self.config.RETRY_DELAY)
-        
+
         self.log.emit("All login attempts failed")
         return False
 
@@ -920,42 +865,42 @@ class ScraperThread(QThread):
             if not os.path.exists(self.links_file):
                 self.log.emit(f"File not found: {self.links_file}")
                 return False
-            
+
             self.log.emit(f"Reading links from: {self.links_file}")
-            
-            # Read Excel file
+
+
             df = pd.read_excel(self.links_file)
             self.log.emit(f"Excel file loaded successfully. Shape: {df.shape}")
-            
-            # Check for Link column
+
+
             if 'Link' not in df.columns:
                 self.log.emit(f"Available columns: {list(df.columns)}")
                 self.log.emit("Error: 'Link' column not found in Excel file")
                 return False
-            
-            # Extract and validate ticket numbers/URLs
+
+
             link_data = df['Link'].dropna().astype(str).tolist()
-            
+
             if not link_data:
                 self.log.emit("No valid ticket numbers found in the Link column")
                 return False
-            
-            # Convert to full URLs
+
+
             self.links = []
             invalid_entries = []
             for item in link_data:
                 clean_item = item.strip()
                 if clean_item.startswith('http'):
-                    # Already a full URL - use as is
+
                     self.links.append(clean_item)
                 else:
                     valid, error_msg = is_valid_ticket(clean_item)
                     if valid:
-                        # Ticket number - convert to URL
+
                         full_url = make_link(clean_item, self.config.BASE_TICKET_URL)
                         self.links.append(full_url)
                     else:
-                        # Try to extract ticket number from URL-like string
+
                         if '/' in clean_item:
                             clean_num = clean_item.split('/')[-1]
                             valid, error_msg = is_valid_ticket(clean_num)
@@ -969,14 +914,14 @@ class ScraperThread(QThread):
 
             if invalid_entries:
                 self.validation_errors.emit(invalid_entries)
-            
+
             if not self.links:
                 self.log.emit("No valid ticket numbers or URLs found after processing")
                 return False
-            
+
             self.log.emit(f"Successfully processed {len(self.links)} ticket URLs")
             return True
-            
+
         except Exception as e:
             self.log.emit(f"Error reading links file: {str(e)}")
             return False
@@ -986,28 +931,28 @@ class ScraperThread(QThread):
         if not hasattr(self, 'links') or not self.links:
             self.log.emit("No links to process")
             return
-        
+
         total_links = len(self.links)
         self.log.emit(f"Starting to process {total_links} tickets...")
         self.start_time = time.time()
-        
+
         for i, link in enumerate(self.links, 1):
             if not self.is_running:
                 self.log.emit("Scraping stopped by user")
                 break
-            
+
             self.log.emit(f"\n--- Processing ticket {i}/{total_links} ---")
-            
-            # Add delay between tickets (except for first one)
+
+
             if i > 1:
                 self.log.emit(f"Waiting {self.config.DELAY_BETWEEN_TICKETS} seconds before next ticket...")
                 time.sleep(self.config.DELAY_BETWEEN_TICKETS)
-            
-            # Process with retry mechanism
+
+
             result = self.process_link_with_retry(link, i, total_links)
             self.results.append(result)
-            
-            # Update progress
+
+
             self.current_ticket = i
             progress = int((i / total_links) * 100)
             self.progress.emit(progress)
@@ -1017,34 +962,34 @@ class ScraperThread(QThread):
         for attempt in range(self.config.MAX_RETRIES):
             try:
                 self.log.emit(f"Attempt {attempt + 1}/{self.config.MAX_RETRIES} for ticket {current_index}")
-                
-                # Clear browser state
-                if attempt > 0:  # Don't clear on first attempt
+
+
+                if attempt > 0:
                     self.clear_browser_state()
-                
+
                 result = self.process_single_ticket(link)
-                
+
                 if result.get('Error Type') != 'Critical':
                     self.log.emit(f"Successfully processed ticket {current_index}")
                     return result
                 else:
                     raise Exception(result.get('Error', 'Unknown error'))
-                
+
             except Exception as e:
                 self.log.emit(f"Attempt {attempt + 1} failed: {str(e)}")
-                
+
                 if attempt < self.config.MAX_RETRIES - 1:
                     self.log.emit(f"Retrying in {self.config.RETRY_DELAY} seconds...")
                     time.sleep(self.config.RETRY_DELAY)
-                    
-                    # Check if we need to re-login
+
+
                     if 'login' in str(e).lower() or 'session' in str(e).lower():
                         self.log.emit("Session might have expired, attempting re-login...")
                         if not self.login():
                             self.log.emit("Re-login failed, continuing with next ticket")
                             break
-        
-        # All attempts failed
+
+
         self.log.emit(f"⚠️ Ticket {current_index} failed after {self.config.MAX_RETRIES} attempts. Continuing with next ticket.")
         return {
             "Contains Keywords": False,
@@ -1130,20 +1075,20 @@ class ScraperThread(QThread):
     def process_single_ticket(self, link):
         """Process a single ticket with comprehensive error handling"""
         try:
-            # Navigate directly to the ticket URL
+
             self.log.emit(f"Loading ticket: {link}")
             self.driver.get(link)
 
-            # Check if we were redirected to the login page
+
             current_url = self.driver.current_url
             if "login" in current_url.lower():
                 self.log.emit("Session expired or redirected to login, attempting to re-login...")
                 if not self.login():
                     raise Exception("Failed to re-login after redirection")
-                # Reload the ticket link
+
                 self.driver.get(link)
 
-            # Wait for main container and content element (indicates page rendering is complete)
+
             wait_short = WebDriverWait(self.driver, 3)
             self.log.emit("Waiting for ticket details to load...")
 
@@ -1154,7 +1099,7 @@ class ScraperThread(QThread):
                 )
                 self.log.emit("Content element loaded successfully.")
             except:
-                # Try fallback content xpath
+
                 try:
                     content_element = wait_short.until(
                         EC.presence_of_element_located((
@@ -1166,7 +1111,7 @@ class ScraperThread(QThread):
                 except Exception as e:
                     self.log.emit("Warning: Content element load timed out. Proceeding with instant extraction.")
 
-            # Extract all other elements instantly
+
             station_element = self._locate_by_xpath_instant(
                 self.config.STATION_XPATH,
                 "/html/body/app-root/app-init-app/div/div/app-ticket-details/div/div[3]/aside/section[1]/div/div[2]/span[2]",
@@ -1203,7 +1148,7 @@ class ScraperThread(QThread):
                 "Last Comment Time"
             )
 
-            # Extract content if element was found
+
             content_text = ""
             if content_element:
                 try:
@@ -1213,7 +1158,7 @@ class ScraperThread(QThread):
                 except Exception as e:
                     self.log.emit(f"Error extracting content text: {str(e)}")
 
-            # Extract station number if element was found
+
             station_number = "N/A"
             if station_element:
                 try:
@@ -1227,7 +1172,7 @@ class ScraperThread(QThread):
             resolved_datetime = self._text_from_element(resolved_datetime_element, "Resolved Date Time")
             ticket_category = self._text_from_element(ticket_category_element, "Ticket Category")
 
-            # Extract comments if element was found
+
             comment_text = ""
             if comment_element:
                 try:
@@ -1237,7 +1182,7 @@ class ScraperThread(QThread):
                 except Exception as e:
                     self.log.emit(f"Error extracting comment text: {str(e)}")
 
-            # Combine content and comments for keyword analysis
+
             combined_text = content_text
             if comment_text:
                 if combined_text:
@@ -1246,7 +1191,7 @@ class ScraperThread(QThread):
                     combined_text = comment_text
             all_text_lower = combined_text.lower()
 
-            # Analyze content for keywords
+
             keywords_found = []
             if all_text_lower:
                 for keyword in self.config.KEYWORD_LIST:
@@ -1255,7 +1200,6 @@ class ScraperThread(QThread):
 
             has_keywords = len(keywords_found) > 0
 
-            # Calculate Closed Within Time
             last_comment_time = "N/A"
             closed_within_time = False
 
@@ -1283,7 +1227,6 @@ class ScraperThread(QThread):
                     self.log.emit(f"Error calculating time difference: {str(e)}")
                     closed_within_time = False
 
-            # Create detailed record
             record = {
                 "Contains Keywords": has_keywords,
                 "URL": link,
@@ -1311,7 +1254,7 @@ class ScraperThread(QThread):
         except TimeoutException as e:
             self.log.emit(f"Timeout loading ticket content: {str(e)}")
             self.log.emit(f"Current page URL: {self.driver.current_url}")
-            self.log.emit(f"Page source: {self.driver.page_source[:1000]}")  # Log first 1000 chars of page source
+            self.log.emit(f"Page source: {self.driver.page_source[:1000]}")
             return {
                 "Contains Keywords": False,
                 "URL": link,
@@ -1320,11 +1263,11 @@ class ScraperThread(QThread):
                 "Error Type": "Timeout",
                 "Processing Status": "Failed"
             }
-            
+
         except Exception as e:
             self.log.emit(f"Error processing ticket: {str(e)}")
             self.log.emit(f"Current page URL: {self.driver.current_url}")
-            self.log.emit(f"Page source: {self.driver.page_source[:1000]}")  # Log first 1000 chars of page source
+            self.log.emit(f"Page source: {self.driver.page_source[:1000]}")
             return {
                 "Contains Keywords": False,
                 "URL": link,
@@ -1340,29 +1283,29 @@ class ScraperThread(QThread):
             if not results:
                 self.log.emit("No results to save")
                 return
-            
+
             df = pd.DataFrame(results)
-            
-            # Create timestamp for backup
+
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Save main results file
+
+
             output_file = "rechecked.xlsx"
             df.to_excel(output_file, index=False)
             self.log.emit(f"Results saved to: {output_file}")
-            
-            # Save backup with timestamp
+
+
             backup_file = f"rechecked_backup_{timestamp}.xlsx"
             df.to_excel(backup_file, index=False)
             self.log.emit(f"Backup saved to: {backup_file}")
-            
-            # Save summary statistics
+
+
             summary = self.generate_summary(results)
             summary_file = f"summary_{timestamp}.json"
             with open(summary_file, 'w') as f:
                 json.dump(summary, f, indent=2)
             self.log.emit(f"Summary saved to: {summary_file}")
-            
+
         except Exception as e:
             self.log.emit(f"Error saving results: {str(e)}")
 
@@ -1372,7 +1315,7 @@ class ScraperThread(QThread):
         successful_tickets = len([r for r in results if r.get('Processing Status') == 'Success'])
         keyword_tickets = len([r for r in results if r.get('Contains Keywords', False)])
         failed_tickets = total_tickets - successful_tickets
-        
+
         return {
             "processing_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "total_tickets": total_tickets,
@@ -1401,7 +1344,7 @@ class LiveMonitorThread(QThread):
     duplicate_detected = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     monitoring_stopped = pyqtSignal()
-    monitor_stats = pyqtSignal(int, int)  # open tab count, tickets captured
+    monitor_stats = pyqtSignal(int, int)
 
     def __init__(self, config, session_start=None):
         super().__init__()
@@ -1421,23 +1364,11 @@ class LiveMonitorThread(QThread):
         self.captured_tickets = []
         self._target_handle_map = {}
         self._last_handle_count = 0
-
-        # Live-monitor baseline state. None means the notification baseline has
-        # not been established yet; using 0 here would make all existing unread
-        # notifications look new on startup.
         self._last_notification_count = None
         self._last_dashboard_ticket_count = 0
         self._dashboard_monitoring_enabled = True
         self._last_dashboard_refresh_time = 0
-        # Ultra-fast dashboard patrol.  The dashboard DOM is sampled every ~200 ms
-        # so a row that appears in ITMIS is surfaced almost immediately.
         self._dashboard_refresh_interval = 0.20
-
-        # Silent server-side ticket feed.  The visible dashboard is NEVER reloaded.
-        # Chrome performance events are used once to identify the same XHR/fetch
-        # request Angular uses for dashboard tickets.  That request is then repeated
-        # inside the logged-in page with fetch(), so fresh server data can be seen
-        # before Angular decides to repaint its table.
         self._silent_api_request = None
         self._silent_api_installed = False
         self._silent_api_discovery_attempts = 0
@@ -1449,8 +1380,6 @@ class LiveMonitorThread(QThread):
         self._silent_api_last_seq = -1
         self._silent_api_baseline_initialized = False
         self._silent_api_baseline_ids = set()
-
-        # Keep secondary work slightly slower so it cannot starve the dashboard watcher.
         self._notification_poll_interval = 0.50
         self._last_notification_poll_time = 0.0
         self._tab_scan_interval = 0.50
@@ -1460,15 +1389,9 @@ class LiveMonitorThread(QThread):
         self._dashboard_baseline_initialized = False
         self._baseline_ticket_ids = set()
         self._last_dashboard_scan_was_loading = False
-
-        # The UI records when Start was pressed. The stricter capture cutoff is
-        # set after login + baseline initialization, because monitoring cannot
-        # safely distinguish new/old tickets until that snapshot is complete.
         self.session_start = session_start or datetime.now()
         self._monitoring_cutoff = None
 
-        # Kept for backwards compatibility with restored session data, but old
-        # preliminary records are no longer automatically re-fetched on startup.
         self.pending_reextract = []
 
     def stop(self):
@@ -1527,8 +1450,8 @@ class LiveMonitorThread(QThread):
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option("useAutomationExtension", False)
-        # Capture Network.request/response events so the monitor can discover the
-        # dashboard's ticket XHR once, then poll it silently without refreshing UI.
+
+
         chrome_options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         if self.config.HEADLESS_MODE:
             chrome_options.add_argument("--headless=new")
@@ -1650,17 +1573,12 @@ class LiveMonitorThread(QThread):
 
     def _initialize_monitoring_baseline(self):
         """Snapshot existing ITMIS state so old tickets are never treated as new."""
-        # Notification count baseline: existing unread notifications are not new.
+
         self._last_notification_count = self._get_notification_count()
         self.status_update.emit(
             f"Notification baseline recorded: {self._last_notification_count} existing notification(s)."
         )
 
-        # Dashboard baseline: wait until Angular has finished replacing the
-        # temporary "Loading tickets..." row with the real dashboard rows.  The
-        # previous implementation accepted that placeholder as an empty baseline,
-        # which made all 15 existing rows look new a moment later and opened every
-        # one of them for verification.
         try:
             current_tickets, dashboard_ready = self._wait_for_stable_dashboard_baseline(
                 max_rows=15, timeout=12.0
@@ -1677,14 +1595,11 @@ class LiveMonitorThread(QThread):
                 f"Dashboard baseline recorded: {len(self._last_known_dashboard_tickets)} existing ticket(s)."
             )
         else:
-            # Important safety behavior: leave initialization deferred.  The first
-            # real dashboard snapshot seen by the monitor loop becomes the baseline
-            # and is NOT opened as a set of new tickets.
+
             self.status_update.emit(
                 "Dashboard was still loading; baseline deferred until the first real ticket snapshot."
             )
 
-        # Also baseline any ticket-detail tabs that already exist in the browser.
         try:
             current_handles = list(self.driver.window_handles)
             self._target_handle_map = self._build_target_to_handle_map() if current_handles else {}
@@ -1699,7 +1614,6 @@ class LiveMonitorThread(QThread):
         except Exception as e:
             self.status_update.emit(f"Open-tab baseline warning: {e}")
 
-        # Effective monitoring begins only after the baseline snapshot is complete.
         self._monitoring_cutoff = datetime.now()
         self.status_update.emit(
             f"Live capture cutoff set to {self._monitoring_cutoff.strftime('%d/%m/%Y %I:%M:%S %p')}."
@@ -1717,7 +1631,6 @@ class LiveMonitorThread(QThread):
 
         text = re.sub(r"\s+", " ", str(raw_value)).strip().upper()
 
-        # 1) Prefer an explicit AM/PM timestamp and parse it only as 12-hour time.
         ampm_patterns = (
             (r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M", "%d/%m/%Y"),
             (r"\d{1,2}/\d{1,2}/\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*[AP]M", "%d/%m/%y"),
@@ -1733,9 +1646,6 @@ class LiveMonitorThread(QThread):
                 except ValueError:
                     pass
 
-        # 2) Only if no AM/PM timestamp was present, allow a true 24-hour time.
-        # The negative look-ahead prevents matching the ``01:07`` prefix of
-        # ``01:07 PM``.
         hour24_patterns = (
             (r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?(?!\s*[AP]M)", "%d/%m/%Y"),
             (r"\d{1,2}/\d{1,2}/\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?(?!\s*[AP]M)", "%d/%m/%y"),
@@ -1759,19 +1669,19 @@ class LiveMonitorThread(QThread):
             return False
         ticket_dt = self._parse_live_ticket_datetime(raw_time)
         if ticket_dt is None:
-            # Never discard a potentially new ticket merely because ITMIS changed
-            # its date format; startup baselines remain the primary protection.
+
+
             return False
 
-        # ITMIS often displays minute precision only. Compare at minute precision
-        # so a ticket created in the same minute as baseline activation is retained.
+
+
         cutoff_minute = self._monitoring_cutoff.replace(second=0, microsecond=0)
         ticket_minute = ticket_dt.replace(second=0, microsecond=0)
         is_old = ticket_minute < cutoff_minute
 
-        # Keep a precise trace for future timing diagnostics.  This is emitted only
-        # when the dashboard asks us to classify a newly appearing row, not on every
-        # 200 ms snapshot.
+
+
+
         self.status_update.emit(
             "Ticket time check: "
             f"raw='{raw_time}' -> {ticket_minute.strftime('%d/%m/%Y %I:%M %p')}; "
@@ -1803,13 +1713,13 @@ class LiveMonitorThread(QThread):
 
                 self._all_tabs_closed_announced = False
 
-                # Highest priority: poll the live dashboard first. This path can run
-                # every ~200 ms and is intentionally independent of slower CDP scans.
+
+
                 self._monitor_dashboard_and_notifications()
 
-                # Manual/open-tab discovery is useful but does not need to run 20
-                # times per second. Throttling it keeps ChromeDriver free for the
-                # dashboard watcher.
+
+
+
                 now = time.time()
                 if now - self._last_tab_scan_time >= self._tab_scan_interval:
                     self._last_tab_scan_time = now
@@ -1869,8 +1779,8 @@ class LiveMonitorThread(QThread):
             except Exception as e:
                 self.status_update.emit(f"Patrol loop error: {e}")
 
-            # 50 ms scheduler tick; the dashboard method itself enforces the
-            # 200 ms scan interval.
+
+
             self._stop_event.wait(0.05)
 
     def _wait_page_settle(self, handle, timeout=1.5):
@@ -1922,8 +1832,8 @@ class LiveMonitorThread(QThread):
                         self.driver.switch_to.window(handle)
                         current_url = self.driver.current_url or ""
 
-                        # A freshly-created background tab may report about:blank
-                        # for a fraction of a second.  Do not abandon it immediately.
+
+
                         if ticket_id.upper() not in current_url.upper():
                             if current_url and current_url != "about:blank":
                                 if wrong_url_since is None:
@@ -1976,9 +1886,9 @@ class LiveMonitorThread(QThread):
                         if first_partial is None:
                             first_partial = time.time()
 
-                        # Prefer a complete record, but do not hold a genuinely new
-                        # ticket for several seconds just because one secondary field
-                        # is slow to render.
+
+
+
                         complete = bool(time_val and station_val and desc_val)
                         partial_ready = first_partial and (time.time() - first_partial >= 0.25)
                         if complete or partial_ready:
@@ -2063,7 +1973,7 @@ class LiveMonitorThread(QThread):
             try:
                 if handle not in self.driver.window_handles:
                     return ""
-                # Try sibling label approach
+
                 labels = self.driver.find_elements(
                     By.XPATH,
                     "//label[contains(translate(text(),'time','TIME'),'TIME')]"
@@ -2073,7 +1983,7 @@ class LiveMonitorThread(QThread):
                     text = (lbl.text or "").strip()
                     if text:
                         return text
-                # Regex scan on page source
+
                 src = self.driver.page_source or ""
                 m = LIVE_MONITOR_TIME_RE.search(src)
                 if m:
@@ -2119,17 +2029,17 @@ class LiveMonitorThread(QThread):
         """Check dashboard for newly issued tickets and return ticket count."""
         try:
             with self._driver_lock:
-                # Navigate to dashboard if not already there
+
                 current_url = self.driver.current_url or ""
                 if "dashboard" not in current_url.lower():
                     self.driver.get(self.config.DASHBOARD_URL)
-                    time.sleep(1)  # Wait for page to load
-                
-                # Count tickets in dashboard table
-                ticket_rows = self.driver.find_elements(By.XPATH, 
+                    time.sleep(1)
+
+
+                ticket_rows = self.driver.find_elements(By.XPATH,
                     '/html/body/app-root/app-init-app/div/div/app-dashboard/div/div[4]/div/div/div/p-scrollpanel/div/div[1]/div/p-table/div/div/table/tbody/tr')
                 ticket_count = len(ticket_rows)
-                
+
                 return ticket_count
         except Exception as e:
             self.status_update.emit(f"Dashboard check error: {e}")
@@ -2139,13 +2049,13 @@ class LiveMonitorThread(QThread):
         """Extract ticket number from the first row of dashboard table."""
         try:
             with self._driver_lock:
-                # Navigate to dashboard if not already there
+
                 current_url = self.driver.current_url or ""
                 if "dashboard" not in current_url.lower():
                     self.driver.get(self.config.DASHBOARD_URL)
-                    time.sleep(2)  # Wait for page to load
-                
-                # Wait for dashboard table to be present
+                    time.sleep(2)
+
+
                 try:
                     WebDriverWait(self.driver, 5).until(
                         EC.presence_of_element_located((By.XPATH, self.config.DASHBOARD_FIRST_TICKET_XPATH))
@@ -2153,41 +2063,41 @@ class LiveMonitorThread(QThread):
                 except:
                     self.status_update.emit("Dashboard table not loaded within timeout")
                     return None, None
-                
-                # Get first row element
+
+
                 first_row = self.driver.find_elements(By.XPATH, self.config.DASHBOARD_FIRST_TICKET_XPATH)
                 if not first_row:
                     self.status_update.emit("No first row found in dashboard table")
                     return None, None
-                
-                # Method 1: Try to extract ticket number from row text
+
+
                 row_text = first_row[0].text
-                self.status_update.emit(f"First row text: {row_text[:100]}...")  # Log first 100 chars
-                
+                self.status_update.emit(f"First row text: {row_text[:100]}...")
+
                 match = TICKET_REGEX.search(row_text)
                 if match:
                     ticket_number = match.group(0)
                     self.status_update.emit(f"Found ticket number from text: {ticket_number}")
-                    
-                    # Try to find a link in the row
+
+
                     link_elements = first_row[0].find_elements(By.TAG_NAME, 'a')
                     if link_elements:
                         ticket_url = link_elements[0].get_attribute('href')
                         self.status_update.emit(f"Found ticket URL from link: {ticket_url}")
                     else:
-                        # Construct URL from ticket number
+
                         ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
                         self.status_update.emit(f"Constructed ticket URL: {ticket_url}")
                     return ticket_number, ticket_url
-                
-                # Method 2: Try to extract from all links in the row
+
+
                 link_elements = first_row[0].find_elements(By.TAG_NAME, 'a')
                 for link in link_elements:
                     link_text = link.text
                     link_href = link.get_attribute('href')
                     self.status_update.emit(f"Link text: {link_text}, Href: {link_href}")
-                    
-                    # Check link href for full ticket number first
+
+
                     if link_href:
                         match = TICKET_REGEX.search(link_href)
                         if match:
@@ -2195,12 +2105,12 @@ class LiveMonitorThread(QThread):
                             ticket_url = link_href
                             self.status_update.emit(f"Found ticket number from link href: {ticket_number}")
                             return ticket_number, ticket_url
-                    
-                    # Check link text for partial ticket number
+
+
                     match = TICKET_REGEX_PARTIAL.search(link_text)
                     if match:
                         partial_ticket = match.group(0)
-                        # If we have href, extract full ticket from it
+
                         if link_href:
                             href_match = TICKET_REGEX.search(link_href)
                             if href_match:
@@ -2208,20 +2118,20 @@ class LiveMonitorThread(QThread):
                                 ticket_url = link_href
                                 self.status_update.emit(f"Found full ticket from href using partial match: {ticket_number}")
                                 return ticket_number, ticket_url
-                        # Otherwise use partial ticket and construct URL
+
                         self.status_update.emit(f"Found partial ticket from link text: {partial_ticket}")
-                        # For partial tickets, we need to get the full ticket from href or construct it
+
                         if link_href:
                             ticket_url = link_href
-                            # Extract full ticket from URL
+
                             url_match = TICKET_REGEX.search(link_href)
                             if url_match:
                                 ticket_number = url_match.group(0)
                                 self.status_update.emit(f"Extracted full ticket from URL: {ticket_number}")
                                 return ticket_number, ticket_url
-                        return None, None  # Can't construct full ticket from partial
-                
-                # Method 3: Try to get innerHTML and search for ticket pattern
+                        return None, None
+
+
                 inner_html = first_row[0].get_attribute('innerHTML')
                 match = TICKET_REGEX.search(inner_html)
                 if match:
@@ -2229,10 +2139,10 @@ class LiveMonitorThread(QThread):
                     self.status_update.emit(f"Found ticket number from innerHTML: {ticket_number}")
                     ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
                     return ticket_number, ticket_url
-                
+
                 self.status_update.emit("No ticket number found in first row using any method")
                 return None, None
-                
+
         except Exception as e:
             self.status_update.emit(f"Extract ticket from dashboard error: {e}")
             return None, None
@@ -2274,9 +2184,9 @@ class LiveMonitorThread(QThread):
                 previous = list(tickets)
                 stable_matches = 0
 
-            # Two matching non-empty snapshots are enough to establish the normal
-            # 15-row baseline.  For a genuinely empty dashboard, wait a little
-            # longer so a slow-loading table is not mistaken for zero tickets.
+
+
+
             if tickets and stable_matches >= 1:
                 return tickets, True
             if not tickets and stable_matches >= 2 and time.time() - first_real_seen >= 2.0:
@@ -2306,10 +2216,10 @@ class LiveMonitorThread(QThread):
                 except Exception:
                     original_handle = handles[0]
 
-                # Keep a stable dashboard tab for monitoring.
+
                 if self._dashboard_handle not in handles:
                     self._dashboard_handle = None
-                    # Prefer the currently selected tab when it is already dashboard.
+
                     try:
                         if "dashboard" in (self.driver.current_url or "").lower():
                             self._dashboard_handle = original_handle
@@ -2326,8 +2236,8 @@ class LiveMonitorThread(QThread):
                             except Exception:
                                 continue
 
-                    # At startup there may not yet be a dashboard tab; reuse the
-                    # current app tab once and keep its handle from then on.
+
+
                     if self._dashboard_handle is None:
                         self._dashboard_handle = original_handle
                         self.driver.switch_to.window(self._dashboard_handle)
@@ -2370,7 +2280,7 @@ class LiveMonitorThread(QThread):
                     int(max_rows),
                 ) or []
 
-                # Preserve the user's selected tab.
+
                 if original_handle in self.driver.window_handles:
                     self.driver.switch_to.window(original_handle)
 
@@ -2383,8 +2293,8 @@ class LiveMonitorThread(QThread):
             for i, row_data in enumerate(raw_rows[:max_rows]):
                 row_text = str((row_data or {}).get("text", "") or "").strip()
                 if i == 0 and row_text:
-                    # Keep the first-row trace because it is useful for diagnosing
-                    # ITMIS-side delays without logging all 15 rows every second.
+
+
                     self.status_update.emit(f"Row 1 text: {row_text[:100]}...")
 
                 row_text_lower = row_text.lower()
@@ -2424,8 +2334,8 @@ class LiveMonitorThread(QThread):
                     "date": "Unknown",
                 }
 
-                # The table already contains enough information to show the ticket
-                # immediately. Prefer real cells over guessing from whitespace.
+
+
                 cells = [
                     str(v or "").strip()
                     for v in ((row_data or {}).get("cells", []) or [])
@@ -2447,7 +2357,7 @@ class LiveMonitorThread(QThread):
                             details["date"] = cell
                             break
                 elif len(words) >= 3:
-                    # Fallback for layouts where the PrimeNG row exposes no td cells.
+
                     idx = 1
                     if idx < len(words):
                         details["assignee"] = words[idx]
@@ -2488,7 +2398,7 @@ class LiveMonitorThread(QThread):
         ids = []
         seen = set()
 
-        # Prefer the prefix already proven by the dashboard baseline.
+
         prefix = "LHR.L2SP"
         for existing in (self._last_known_dashboard_tickets or list(self._baseline_ticket_ids)):
             if TICKET_REGEX.match(str(existing or "")):
@@ -2497,7 +2407,7 @@ class LiveMonitorThread(QThread):
                     prefix = ".".join(parts[:2])
                     break
 
-        # Full IDs, when present.
+
         full_re = re.compile(
             r'\b[A-Z]{2,5}\.[A-Z0-9]{2,8}\.\d{4}\.\d{2}\.\d{6,10}\b',
             re.IGNORECASE,
@@ -2508,7 +2418,7 @@ class LiveMonitorThread(QThread):
                 seen.add(ticket_id)
                 ids.append(ticket_id)
 
-        # Many APIs return only the numeric/year portion used by the dashboard.
+
         for partial in TICKET_REGEX_PARTIAL.findall(text):
             ticket_id = f"{prefix}.{str(partial).upper()}"
             if ticket_id not in seen and TICKET_REGEX.match(ticket_id):
@@ -2520,11 +2430,11 @@ class LiveMonitorThread(QThread):
     def _extract_api_details(self, body_text, ticket_number):
         """Best-effort details from the JSON object containing a ticket ID."""
         details = {
-            "assignee": "Unknown",
-            "station": "Unknown station",
-            "description": "Server ticket detected — details loading",
-            "priority": "Unknown",
-            "date": "Server time pending",
+            "assignee": "",
+            "station": "",
+            "description": "PMA Issued a NEW Ticket - Click to view details",
+            "priority": "",
+            "date": "",
         }
         try:
             data = json.loads(str(body_text or ""))
@@ -2562,7 +2472,7 @@ class LiveMonitorThread(QThread):
             return details
 
         def pick(key_words, default):
-            # Exact-ish keys first, then substring keys. Ignore nested collections.
+
             lowered = {str(k).lower(): v for k, v in target.items()}
             for wanted in key_words:
                 for key, value in lowered.items():
@@ -2655,8 +2565,8 @@ class LiveMonitorThread(QThread):
                     baseline_needles.add(tid.lower())
                     baseline_needles.add(".".join(tid.split(".")[-3:]).lower())
 
-                # Newest responses first; the initial dashboard data call is often
-                # near the end of the performance stream.
+
+
                 for request_id, response_url in reversed(responses):
                     req = requests.get(request_id, {})
                     url = req.get("url") or response_url
@@ -2681,8 +2591,8 @@ class LiveMonitorThread(QThread):
                     if not baseline_hit or len(found_ids) < 2:
                         continue
 
-                    # Keep only headers browser fetch is allowed to set and which
-                    # may actually be needed by the authenticated API request.
+
+
                     safe_headers = {}
                     for key, value in (req.get("headers") or {}).items():
                         lk = str(key).lower()
@@ -2860,8 +2770,8 @@ class LiveMonitorThread(QThread):
             f"{detected.strftime('%H:%M:%S.%f')[:-3]}: {new_ids}"
         )
         for ticket_number in new_ids:
-            # Add immediately to the API baseline so repeated snapshots cannot emit
-            # a second alert while full-detail extraction is starting.
+
+
             self._silent_api_baseline_ids.add(ticket_number)
             ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
             details = self._extract_api_details(body, ticket_number)
@@ -2880,7 +2790,7 @@ class LiveMonitorThread(QThread):
                 count_element = self.driver.find_elements(By.XPATH, self.config.NOTIFICATION_COUNT_XPATH)
                 if count_element:
                     count_text = count_element[0].text.strip()
-                    # Extract number from text (e.g., "5" or "5+")
+
                     import re
                     match = re.search(r'\d+', count_text)
                     if match:
@@ -2897,7 +2807,7 @@ class LiveMonitorThread(QThread):
                 bell_icon = self.driver.find_elements(By.XPATH, self.config.NOTIFICATION_BELL_ICON_XPATH)
                 if bell_icon:
                     bell_icon[0].click()
-                    time.sleep(0.5)  # Wait for dropdown to open
+                    time.sleep(0.5)
                     return True
                 return False
         except Exception as e:
@@ -2908,7 +2818,7 @@ class LiveMonitorThread(QThread):
         """Extract ticket number and link from the first notification."""
         try:
             with self._driver_lock:
-                # Wait for notification dropdown to be visible
+
                 try:
                     WebDriverWait(self.driver, 3).until(
                         EC.presence_of_element_located((By.XPATH, self.config.NOTIFICATION_LINK_XPATH))
@@ -2916,90 +2826,90 @@ class LiveMonitorThread(QThread):
                 except:
                     self.status_update.emit("Notification dropdown not loaded within timeout")
                     return None, None
-                
-                # Method 1: Try to get ticket number from the specific xpath
+
+
                 ticket_number_element = self.driver.find_elements(By.XPATH, self.config.NOTIFICATION_TICKET_NUMBER_XPATH)
                 if ticket_number_element:
                     ticket_number = ticket_number_element[0].text.strip()
                     self.status_update.emit(f"Notification ticket number element text: {ticket_number}")
-                    # Validate ticket format
+
                     valid, _ = is_valid_ticket(ticket_number)
                     if valid:
-                        # Get the link element
+
                         link_element = self.driver.find_elements(By.XPATH, self.config.NOTIFICATION_LINK_XPATH)
                         if link_element:
                             ticket_url = link_element[0].get_attribute('href')
-                            # Handle javascript:void(0) by constructing URL
+
                             if not ticket_url or ticket_url == 'javascript:void(0)':
                                 ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
                             self.status_update.emit(f"Found ticket from notification xpath: {ticket_number}")
                             return ticket_number, ticket_url
-                
-                # Method 2: Try to extract ticket number from link text
+
+
                 link_element = self.driver.find_elements(By.XPATH, self.config.NOTIFICATION_LINK_XPATH)
                 if link_element:
                     link_text = link_element[0].text
                     link_href = link_element[0].get_attribute('href')
                     self.status_update.emit(f"Notification link text: {link_text}, Href: {link_href}")
-                    
+
                     match = TICKET_REGEX.search(link_text)
                     if match:
                         ticket_number = match.group(0)
-                        # Handle javascript:void(0) by constructing URL
+
                         if not link_href or link_href == 'javascript:void(0)':
                             ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
                         else:
                             ticket_url = link_href
                         self.status_update.emit(f"Found ticket from notification link text: {ticket_number}")
                         return ticket_number, ticket_url
-                    
-                    # Check link href for ticket number
+
+
                     if link_href and link_href != 'javascript:void(0)':
                         match = TICKET_REGEX.search(link_href)
                         if match:
                             ticket_number = match.group(0)
                             self.status_update.emit(f"Found ticket from notification link href: {ticket_number}")
                             return ticket_number, link_href
-                
-                # Method 3: Try to search all notification links
-                all_links = self.driver.find_elements(By.XPATH, 
+
+
+                all_links = self.driver.find_elements(By.XPATH,
                     '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/div/div[2]/a')
                 for i, link in enumerate(all_links):
                     link_text = link.text
                     link_href = link.get_attribute('href')
                     self.status_update.emit(f"Notification link {i}: text={link_text[:50]}, href={link_href}")
-                    
+
                     match = TICKET_REGEX.search(link_text)
                     if match:
                         ticket_number = match.group(0)
-                        # Handle javascript:void(0) by constructing URL
+
                         if not link_href or link_href == 'javascript:void(0)':
                             ticket_url = f"{self.config.BASE_TICKET_URL}{ticket_number}"
                         else:
                             ticket_url = link_href
                         self.status_update.emit(f"Found ticket from notification link {i}: {ticket_number}")
                         return ticket_number, ticket_url
-                    
+
                     if link_href and link_href != 'javascript:void(0)':
                         match = TICKET_REGEX.search(link_href)
                         if match:
                             ticket_number = match.group(0)
                             self.status_update.emit(f"Found ticket from notification link {i} href: {ticket_number}")
                             return ticket_number, link_href
-                
-                # Method 4: Try partial ticket number from link text
-                all_links = self.driver.find_elements(By.XPATH, 
+
+
+                all_links = self.driver.find_elements(By.XPATH,
                     '/html/body/app-root/app-init-app/div/app-bar-menu/div/div/div[2]/div/app-notification-bell/div/div/div[2]/a')
                 for i, link in enumerate(all_links):
                     link_text = link.text
                     link_href = link.get_attribute('href')
-                    
+
                     match = TICKET_REGEX_PARTIAL.search(link_text)
                     if match:
                         partial_ticket = match.group(0)
                         self.status_update.emit(f"Found partial ticket from notification link {i}: {partial_ticket}")
-                        # We can't construct full ticket from partial without knowing the prefix
-                        # Try to click the link to get the actual URL or navigate
+
+
                         try:
                             link.click()
                             time.sleep(1)
@@ -3010,13 +2920,13 @@ class LiveMonitorThread(QThread):
                                     ticket_number = url_match.group(0)
                                     self.status_update.emit(f"Got full ticket from navigation: {ticket_number}")
                                     return ticket_number, current_url
-                            # Go back to dashboard
+
                             self.driver.get(self.config.DASHBOARD_URL)
                             time.sleep(1)
                         except:
                             pass
                         return None, None
-                
+
                 self.status_update.emit("No ticket number found in notification using any method")
                 return None, None
         except Exception as e:
@@ -3030,8 +2940,8 @@ class LiveMonitorThread(QThread):
                 before = set(self.driver.window_handles)
                 original_handle = self.driver.current_window_handle
 
-                # Opening the final URL directly is much faster than opening a blank
-                # tab, switching to it, driver.get(...), sleeping, then switching back.
+
+
                 self.driver.execute_script(
                     "window.open(arguments[0], '_blank');", ticket_url
                 )
@@ -3046,8 +2956,8 @@ class LiveMonitorThread(QThread):
                         break
                     time.sleep(0.03)
 
-                # window.open normally leaves focus on the dashboard, but force it
-                # back to the original handle so the monitor and extractor cannot race.
+
+
                 if original_handle in self.driver.window_handles:
                     self.driver.switch_to.window(original_handle)
 
@@ -3069,8 +2979,8 @@ class LiveMonitorThread(QThread):
             self.status_update.emit(f"Failed to open ticket {ticket_number} in new tab ({source_label}).")
             return False
 
-        # Mark processed now that we own extraction ourselves — this also makes the patrol loop's
-        # own CDP tab-scan skip this handle/URL (as a benign duplicate) instead of racing us for it.
+
+
         self.processed_urls.add(ticket_url)
         self._processed_ids.add(ticket_number)
         self.tab_pending[handle] = 3
@@ -3104,7 +3014,7 @@ class LiveMonitorThread(QThread):
             if ticket_id in self._processed_ids:
                 continue
             self._capture_ticket_via_new_tab(ticket_id, ticket_url, source_label="Restored")
-            time.sleep(1.5)  # stagger tab opens so Chrome/Angular aren't hit all at once
+            time.sleep(1.5)
 
     def _emit_immediate_dashboard_record(self, ticket_number, ticket_url, details):
         """Surface a newly visible dashboard ticket immediately.
@@ -3152,14 +3062,8 @@ class LiveMonitorThread(QThread):
         try:
             current_time = time.time()
 
-            # ----- Silent API: highest priority path -----
-            # Reads the browser-side fetch poller. It can surface a server-side ticket
-            # before Angular updates the visible dashboard table, without any reload.
             self._poll_silent_ticket_api()
 
-            # ----- Dashboard DOM: secondary confirmation/fallback -----
-            # The existing 200 ms scan remains in place in case API discovery is not
-            # available in a particular ITMIS build/session.
             if current_time - self._last_dashboard_refresh_time >= self._dashboard_refresh_interval:
                 self._last_dashboard_refresh_time = current_time
 
@@ -3195,8 +3099,6 @@ class LiveMonitorThread(QThread):
                             details = ticket_details.get(new_ticket, {})
                             ticket_url = f"{self.config.BASE_TICKET_URL}{new_ticket}"
 
-                            # If the dashboard row itself exposes a start datetime, reject
-                            # an old/reordered row before showing or opening it.
                             row_time = details.get("date")
                             if row_time and self._is_pre_session_ticket(row_time):
                                 self._baseline_ticket_ids.add(new_ticket)
@@ -3205,8 +3107,6 @@ class LiveMonitorThread(QThread):
                                 )
                                 continue
 
-                            # Show it NOW from the dashboard row. The full detail page
-                            # will replace this preliminary card in the background.
                             self._emit_immediate_dashboard_record(
                                 new_ticket, ticket_url, details
                             )
@@ -3220,12 +3120,6 @@ class LiveMonitorThread(QThread):
 
                     self._last_known_dashboard_tickets = list(current_dashboard_tickets)
 
-                # No visible refresh is performed here. Fresh server data is handled
-                # by the silent API poller; this DOM scan is confirmation/fallback only.
-
-            # ----- Notification bell: secondary path -----
-            # Polling it less often prevents its Selenium lookup from slowing the
-            # 200 ms dashboard watcher. It remains a useful fallback.
             if current_time - self._last_notification_poll_time >= self._notification_poll_interval:
                 self._last_notification_poll_time = current_time
                 current_notification_count = self._get_notification_count()
@@ -3268,7 +3162,7 @@ class LiveMonitorThread(QThread):
 class ConfigDialog(QWidget):
     """Configuration dialog for advanced settings"""
     finished = pyqtSignal()
-    
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -3290,12 +3184,12 @@ class ConfigDialog(QWidget):
         """
         super().showEvent(event)
         enable_acrylic_blur(self)
-        
+
     def init_ui(self):
         self.setWindowTitle("Configuration Settings")
         self.setGeometry(200, 200, 660, 540)
         self.setMinimumSize(660, 540)
-        # Use a more readable UI font; keep monospace only where needed (logs / code-like fields)
+
         self.setFont(QFont("Segoe UI", 10))
         self.setStyleSheet("""
             QWidget {
@@ -3413,88 +3307,88 @@ class ConfigDialog(QWidget):
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
-        
+
         layout = QVBoxLayout()
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(12)
-        
-        # Create tabs
+
+
         tabs = QTabWidget()
-        
-        # General tab
+
+
         general_tab = QWidget()
         general_layout = QFormLayout()
-        
+
         self.login_url_edit = QLineEdit(self.config.LOGIN_URL)
         self.dashboard_url_edit = QLineEdit(self.config.DASHBOARD_URL)
         self.base_ticket_url_edit = QLineEdit(self.config.BASE_TICKET_URL)
-        
+
         general_layout.addRow("Login URL:", self.login_url_edit)
         general_layout.addRow("Dashboard URL:", self.dashboard_url_edit)
         general_layout.addRow("Base Ticket URL:", self.base_ticket_url_edit)
-        
+
         general_tab.setLayout(general_layout)
         tabs.addTab(general_tab, "General")
-        
-        # Timing tab
+
+
         timing_tab = QWidget()
         timing_layout = QFormLayout()
-        
+
         self.login_timeout_spin = QSpinBox()
         self.login_timeout_spin.setRange(10, 300)
         self.login_timeout_spin.setValue(self.config.LOGIN_TIMEOUT)
-        
+
         self.page_load_timeout_spin = QSpinBox()
         self.page_load_timeout_spin.setRange(5, 120)
         self.page_load_timeout_spin.setValue(self.config.PAGE_LOAD_TIMEOUT)
-        
+
         self.delay_spin = QSpinBox()
         self.delay_spin.setRange(0, 30)
         self.delay_spin.setValue(self.config.DELAY_BETWEEN_TICKETS)
-        
+
         timing_layout.addRow("Login Timeout (seconds):", self.login_timeout_spin)
         timing_layout.addRow("Page Load Timeout (seconds):", self.page_load_timeout_spin)
         timing_layout.addRow("Delay Between Tickets (seconds):", self.delay_spin)
-        
+
         timing_tab.setLayout(timing_layout)
         tabs.addTab(timing_tab, "Timing")
-        
-        # Retry tab
+
+
         retry_tab = QWidget()
         retry_layout = QFormLayout()
-        
+
         self.max_retries_spin = QSpinBox()
         self.max_retries_spin.setRange(1, 10)
         self.max_retries_spin.setValue(self.config.MAX_RETRIES)
-        
+
         self.retry_delay_spin = QSpinBox()
         self.retry_delay_spin.setRange(1, 60)
         self.retry_delay_spin.setValue(self.config.RETRY_DELAY)
-        
+
         retry_layout.addRow("Max Retries:", self.max_retries_spin)
         retry_layout.addRow("Retry Delay (seconds):", self.retry_delay_spin)
-        
+
         retry_tab.setLayout(retry_layout)
         tabs.addTab(retry_tab, "Retry")
-        
-        # Chrome tab
+
+
         chrome_tab = QWidget()
         chrome_layout = QFormLayout()
-        
+
         self.chrome_binary_edit = QLineEdit(self.config.CHROME_BINARY_PATH)
         self.headless_checkbox = QCheckBox()
         self.headless_checkbox.setChecked(self.config.HEADLESS_MODE)
-        
+
         chrome_layout.addRow("Chrome Binary Path:", self.chrome_binary_edit)
         chrome_layout.addRow("Headless Mode:", self.headless_checkbox)
-        
+
         chrome_tab.setLayout(chrome_layout)
         tabs.addTab(chrome_tab, "Chrome")
-        
-        # Content tab
+
+
         content_tab = QWidget()
         content_layout = QFormLayout()
-        
+
         self.sensor_keywords_edit = QLineEdit(",".join(self.config.KEYWORD_LIST))
         self.content_xpath_edit = QLineEdit(self.config.CONTENT_XPATH)
         self.comment_xpath_edit = QLineEdit(self.config.COMMENT_XPATH)
@@ -3503,7 +3397,7 @@ class ConfigDialog(QWidget):
         self.ticket_start_time_xpath_edit = QLineEdit(self.config.TICKET_START_TIME_XPATH)
         self.resolved_datetime_xpath_edit = QLineEdit(self.config.RESOLVED_DATETIME_XPATH)
         self.ticket_category_xpath_edit = QLineEdit(self.config.TICKET_CATEGORY_XPATH)
-        
+
         content_layout.addRow("Keywords (comma-separated):", self.sensor_keywords_edit)
         content_layout.addRow("Content XPath:", self.content_xpath_edit)
         content_layout.addRow("Comment XPath:", self.comment_xpath_edit)
@@ -3513,13 +3407,13 @@ class ConfigDialog(QWidget):
         content_layout.addRow("Resolved Date Time XPath:", self.resolved_datetime_xpath_edit)
         content_layout.addRow("Ticket Category XPath:", self.ticket_category_xpath_edit)
 
-        
+
         content_tab.setLayout(content_layout)
         tabs.addTab(content_tab, "Content")
-        
+
         layout.addWidget(tabs)
-        
-        # Buttons
+
+
         button_layout = QHBoxLayout()
         save_button = QPushButton("Save")
         cancel_button = QPushButton("Cancel")
@@ -3528,18 +3422,18 @@ class ConfigDialog(QWidget):
         save_button.setObjectName("primary")
         cancel_button.setObjectName("secondary")
         reset_button.setObjectName("danger")
-        
+
         save_button.clicked.connect(self.save_config)
         cancel_button.clicked.connect(self.close)
         reset_button.clicked.connect(self.reset_defaults)
-        
+
         button_layout.addWidget(save_button)
         button_layout.addWidget(cancel_button)
         button_layout.addWidget(reset_button)
-        
+
         layout.addLayout(button_layout)
         self.setLayout(layout)
-    
+
     def save_config(self):
         """Save configuration changes"""
         self.config.LOGIN_URL = self.login_url_edit.text()
@@ -3562,24 +3456,24 @@ class ConfigDialog(QWidget):
         self.config.TICKET_START_TIME_XPATH = self.ticket_start_time_xpath_edit.text()
         self.config.RESOLVED_DATETIME_XPATH = self.resolved_datetime_xpath_edit.text()
         self.config.TICKET_CATEGORY_XPATH = self.ticket_category_xpath_edit.text()
-        
+
         self.config.save_settings()
         QMessageBox.information(self, "Settings Saved", "Configuration has been saved successfully!")
-        self.finished.emit()  # Emit finished signal
+        self.finished.emit()
         self.close()
-    
+
     def reset_defaults(self):
         """Reset to default values"""
-        reply = QMessageBox.question(self, "Reset Settings", 
+        reply = QMessageBox.question(self, "Reset Settings",
                                    "Are you sure you want to reset all settings to defaults?",
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        
+
         if reply == QMessageBox.StandardButton.Yes:
-            # Clear settings and reload defaults
+
             self.config.settings.clear()
             self.config.load_defaults()
-            
-            # Update UI
+
+
             self.login_url_edit.setText(self.config.LOGIN_URL)
             self.dashboard_url_edit.setText(self.config.DASHBOARD_URL)
             self.base_ticket_url_edit.setText(self.config.BASE_TICKET_URL)
@@ -3602,7 +3496,7 @@ class ConfigDialog(QWidget):
 def resource_path(relative):
     """Return absolute path to resource — works for dev and PyInstaller EXE."""
     if getattr(sys, "frozen", False):
-        base = sys._MEIPASS  # type: ignore[attr-defined]
+        base = sys._MEIPASS
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, relative)
@@ -3736,7 +3630,7 @@ class CustomTitleBar(QWidget):
         if (self._drag_global_pos is not None and
                 event.buttons() & Qt.MouseButton.LeftButton):
             if self._window.isMaximized():
-                # Restore before dragging, similar to a native Windows title bar.
+
                 ratio = max(0.05, min(0.95, event.position().x() / max(1, self.width())))
                 old_width = self._window.width()
                 self._window.showNormal()
@@ -3955,11 +3849,11 @@ class MainWindow(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        # Load background image
+
         bg_path = os.path.join(os.path.dirname(__file__), "background.png")
         self._bg_pixmap = QPixmap(bg_path) if os.path.exists(bg_path) else None
 
-        # Keep window translucent
+
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self.init_ui()
@@ -3972,37 +3866,37 @@ class MainWindow(QMainWindow):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         if self._bg_pixmap and not self._bg_pixmap.isNull():
-            # Scale image to cover the whole window (no dark bars)
+
             scaled = self._bg_pixmap.scaled(
                 self.size(),
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation
             )
 
-            # Center the image
+
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
 
             painter.drawPixmap(x, y, scaled)
         else:
-            # Fallback – fully transparent
+
             painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
 
         super().paintEvent(event)
 
-        
+
     def init_ui(self):
         self.setWindowTitle("ITMIS Ticket Scraper v2.0")
         self.setMinimumSize(1000, 780)
         self.resize(1120, 960)
 
-        # No menu bar
+
         self.menuBar().setVisible(False)
 
-        # Use a readable UI font; keep monospace only where needed (log area)
+
         self.setFont(QFont("Segoe UI", 10))
 
-        # ── Global Glassmorphism stylesheet ──────────────────────
+
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(f"""
             QMainWindow, QWidget#centralWidget, QTabWidget::pane {{
@@ -4145,29 +4039,29 @@ class MainWindow(QMainWindow):
             }}
         """)
 
-        # ── Keyboard shortcuts ─────────────────────────────────
+
         QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self.select_file)
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self.start_scraping)
         QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(lambda: self.log_area.clear())
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(QApplication.quit)
 
-        # ── Root layout ────────────────────────────────────────
+
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         root_layout = QVBoxLayout(main_widget)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # ── Window border/title bar ─────────────────────────────
-        # Frameless title bar lets us place the persistent Pin control directly
-        # beside Minimize while retaining normal Minimize/Maximize/Close actions.
+
+
+
         self.custom_title_bar = CustomTitleBar(self)
         root_layout.addWidget(self.custom_title_bar)
         self.size_grip = QSizeGrip(self)
         self.size_grip.setToolTip("Drag to resize")
         self.size_grip.raise_()
 
-        # ── Header banner ──────────────────────────────────────
+
         header = QWidget()
         header.setFixedHeight(62)
         header.setStyleSheet("""
@@ -4185,7 +4079,7 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(18, 0, 20, 0)
         header_layout.setSpacing(14)
 
-        # Logo (text fallback if file absent)
+
         logo_path = resource_path("logo.ico")
         logo_lbl = QLabel()
         logo_lbl.setFixedSize(38, 38)
@@ -4231,13 +4125,13 @@ class MainWindow(QMainWindow):
         header_layout.addStretch()
         root_layout.addWidget(header)
 
-        # ── Dashboard container (top of splitter) ─────────────
+
         dashboard_widget = QWidget()
         dash_layout = QVBoxLayout(dashboard_widget)
         dash_layout.setContentsMargins(14, 10, 14, 6)
         dash_layout.setSpacing(8)
 
-        # File selection row
+
         file_row = QWidget()
         file_row.setStyleSheet("background: transparent;")
         file_row_h = QHBoxLayout(file_row)
@@ -4274,9 +4168,9 @@ class MainWindow(QMainWindow):
         file_row_h.addWidget(self.file_label, 1)
         dash_layout.addWidget(file_row)
 
-        # Buttons and status are now in Bento Box cards
 
-        # ── Cards Grid (Complete Bento Box layout) ────────────────
+
+
         cards_grid_widget = QWidget()
         cards_grid_widget.setStyleSheet("background: transparent;")
         cards_grid = QGridLayout(cards_grid_widget)
@@ -4290,8 +4184,8 @@ class MainWindow(QMainWindow):
         cards_grid.setRowStretch(2, 1)
         cards_grid.setRowStretch(3, 2)
 
-        # Complete Bento Box Layout: 3 columns with complex spans
-        # Row 0: Config (1x1) + Stats (1x1) + Link Generator (4x1 - spans all rows)
+
+
         config_section = self.create_config_section()
         cards_grid.addWidget(config_section, 0, 0, 1, 1)
 
@@ -4301,34 +4195,34 @@ class MainWindow(QMainWindow):
         link_generator_section = self.create_link_generator_section()
         cards_grid.addWidget(link_generator_section, 0, 2, 4, 1)
 
-        # Row 1: Quick Actions (1x1) + System Status (1x1)
+
         quick_actions_section = self.create_quick_actions_section()
         cards_grid.addWidget(quick_actions_section, 1, 0, 1, 1)
 
         system_status_section = self.create_system_status_section()
         cards_grid.addWidget(system_status_section, 1, 1, 1, 1)
 
-        # Row 2: Help/Info (1x1) + Recent Activity (1x1)
+
         help_section = self.create_help_section()
         cards_grid.addWidget(help_section, 2, 0, 1, 1)
 
         recent_activity_section = self.create_recent_activity_section()
         cards_grid.addWidget(recent_activity_section, 2, 1, 1, 1)
 
-        # Row 3: Live Console (spans both left columns)
+
         live_console_section = self.create_live_console_section()
         cards_grid.addWidget(live_console_section, 3, 0, 1, 2)
 
         dash_layout.addWidget(cards_grid_widget)
 
-        # Main tabs: Dashboard + Live Monitor
+
         self.main_tabs = QTabWidget()
         self.main_tabs.addTab(dashboard_widget, "Dashboard")
         self.live_monitor_tab = self.create_live_monitor_tab()
         self.main_tabs.addTab(self.live_monitor_tab, "Live Monitor")
         root_layout.addWidget(self.main_tabs)
 
-        # ── Initialize log ─────────────────────────────────────
+
         self.log("ITMIS Ticket Scraper initialized")
         self.log(f"Configuration loaded — Max retries: {self.config.MAX_RETRIES}, Delay: {self.config.DELAY_BETWEEN_TICKETS}s")
 
@@ -4362,7 +4256,7 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
 
-        # setWindowFlag can recreate the native HWND; restore the acrylic effect.
+
         QTimer.singleShot(0, lambda: enable_acrylic_blur(self, tint_rgba=(255, 255, 255, 10)))
 
     def _setup_notification_system(self):
@@ -4431,7 +4325,7 @@ class MainWindow(QMainWindow):
         self._notification_toasts[ticket_id] = toast
         self._notification_toast_order.append(ticket_id)
 
-        # Keep the newest three alerts visible so a burst of tickets remains readable.
+
         while len(self._notification_toast_order) > 3:
             oldest_id = self._notification_toast_order[0]
             oldest = self._notification_toasts.get(oldest_id)
@@ -4549,7 +4443,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -4583,7 +4477,7 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QHBoxLayout(body)
@@ -4625,7 +4519,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -4659,7 +4553,7 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QHBoxLayout(body)
@@ -4699,7 +4593,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -4733,14 +4627,14 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(16, 12, 16, 12)
         body_layout.setSpacing(10)
 
-        # Stats bar (like Chrome extension)
+
         stats_bar = QWidget()
         stats_bar.setStyleSheet("background: transparent;")
         stats_layout = QHBoxLayout(stats_bar)
@@ -4810,14 +4704,14 @@ class MainWindow(QMainWindow):
         stats_layout.addStretch()
         body_layout.addWidget(stats_bar)
 
-        # Input area with file upload
+
         input_container = QWidget()
         input_container.setStyleSheet("background: transparent;")
         input_layout = QVBoxLayout(input_container)
         input_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(8)
 
-        # Hint + example row
+
         file_row = QWidget()
         file_row.setStyleSheet("background: transparent;")
         file_row_h = QHBoxLayout(file_row)
@@ -4844,7 +4738,7 @@ class MainWindow(QMainWindow):
         file_row_h.addStretch()
         input_layout.addWidget(file_row)
 
-        # Text input
+
         self.ticket_input = QTextEdit()
         self.ticket_input.setPlaceholderText("Paste ticket numbers here (one per line):\nLHR.L2SP.2024.08.00074528\nLHR.L2SP.2024.01.00012345")
         self.ticket_input.setMaximumHeight(80)
@@ -4876,7 +4770,7 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.ticket_input)
         body_layout.addWidget(input_container)
 
-        # Action buttons row
+
         btn_row = QWidget()
         btn_row.setStyleSheet("background: transparent;")
         btn_row_h = QHBoxLayout(btn_row)
@@ -4919,7 +4813,7 @@ class MainWindow(QMainWindow):
         btn_row_h.addStretch()
         body_layout.addWidget(btn_row)
 
-        # Search and filter bar
+
         search_filter_row = QWidget()
         search_filter_row.setStyleSheet("background: transparent;")
         search_filter_h = QHBoxLayout(search_filter_row)
@@ -4979,7 +4873,7 @@ class MainWindow(QMainWindow):
         search_filter_h.addWidget(self.filter_all_btn)
         body_layout.addWidget(search_filter_row)
 
-        # Results list (scrollable)
+
         self.link_results_scroll = QScrollArea()
         self.link_results_scroll.setWidgetResizable(True)
         self.link_results_scroll.setMinimumHeight(120)
@@ -5014,7 +4908,7 @@ class MainWindow(QMainWindow):
         self.link_results_scroll.setWidget(self.link_results_container)
         body_layout.addWidget(self.link_results_scroll)
 
-        # ── Validation error panel (hidden until errors exist) ──
+
         self.validation_error_panel = QWidget()
         self.validation_error_panel.setVisible(False)
         self.validation_error_panel.setStyleSheet("background: transparent;")
@@ -5074,9 +4968,9 @@ class MainWindow(QMainWindow):
         body_layout.addWidget(self.validation_error_panel)
         outer.addWidget(body)
 
-        # Initialize storage
+
         self.generated_links = []
-        self.generated_items = []  # Store full item data (ticket, link, valid)
+        self.generated_items = []
         self.filter_mode = 'valid'
 
         return section
@@ -5099,7 +4993,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -5133,33 +5027,33 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(14, 12, 14, 12)
         body_layout.setSpacing(8)
 
-        # Start button
+
         self.start_button = QPushButton("▶  START")
         self.start_button.clicked.connect(self.start_scraping)
         self.start_button.setMinimumHeight(36)
         self.start_button.setStyleSheet(BTN_SUCCESS)
 
-        # Stop button
+
         self.stop_button = QPushButton("⏸  STOP")
         self.stop_button.clicked.connect(self.stop_scraping)
         self.stop_button.setEnabled(False)
         self.stop_button.setMinimumHeight(36)
         self.stop_button.setStyleSheet(BTN_DANGER_OUTLINE)
 
-        # Config button
+
         self.config_button = QPushButton("⚙  SETTINGS")
         self.config_button.clicked.connect(self.open_config)
         self.config_button.setMinimumHeight(36)
         self.config_button.setStyleSheet(BTN_PRIMARY_OUTLINE)
 
-        # Clear log button
+
         self.clear_log_button = QPushButton("✕  CLEAR LOG")
         self.clear_log_button.clicked.connect(lambda: self.log_area.clear())
         self.clear_log_button.setToolTip("Clear log (Ctrl+L)")
@@ -5192,7 +5086,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -5226,14 +5120,14 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(14, 12, 14, 12)
         body_layout.setSpacing(10)
 
-        # Status label
+
         self.status_label = QLabel("●  READY")
         self.status_label.setStyleSheet("""
             QLabel {
@@ -5250,7 +5144,7 @@ class MainWindow(QMainWindow):
         """)
         body_layout.addWidget(self.status_label)
 
-        # Progress bar
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setFixedHeight(8)
@@ -5298,7 +5192,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -5332,7 +5226,7 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QVBoxLayout(body)
@@ -5378,7 +5272,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -5412,7 +5306,7 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QVBoxLayout(body)
@@ -5453,7 +5347,7 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Card header strip
+
         header_bar = QWidget()
         header_bar.setFixedHeight(30)
         header_bar.setStyleSheet("""
@@ -5487,7 +5381,7 @@ class MainWindow(QMainWindow):
         hb_layout.addStretch()
         outer.addWidget(header_bar)
 
-        # Content area
+
         body = QWidget()
         body.setStyleSheet("QWidget { background: transparent; }")
         body_layout = QVBoxLayout(body)
@@ -5532,13 +5426,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Input", "Please enter ticket numbers first!")
             return
 
-        # Parse ticket numbers
+
         tickets = parse_tickets(raw_input)
         if not tickets:
             QMessageBox.warning(self, "No Tickets", "No valid ticket numbers found in the input!")
             return
 
-        # Validate and convert to links
+
         self.generated_items = []
         self.generated_links = []
 
@@ -5556,7 +5450,7 @@ class MainWindow(QMainWindow):
                 'error': error_msg
             })
 
-        # Update stats
+
         total = len(tickets)
         valid_count = len([item for item in self.generated_items if item['valid']])
         invalid_count = total - valid_count
@@ -5565,7 +5459,7 @@ class MainWindow(QMainWindow):
         self.stat_valid.setText(str(valid_count))
         self.stat_invalid.setText(str(invalid_count))
 
-        # Enable/disable buttons based on results
+
         if valid_count > 0:
             self.download_excel_btn.setEnabled(True)
             self.download_txt_btn.setEnabled(True)
@@ -5573,7 +5467,7 @@ class MainWindow(QMainWindow):
             self.log(f"✅ Generated {valid_count} valid links from {total} tickets")
             if invalid_count > 0:
                 self.log(f"⚠️ Skipped {invalid_count} invalid ticket numbers")
-                # Show errors in the card panel
+
                 invalid_items = [item for item in self.generated_items if not item['valid']]
                 error_lines = [f"  {item['ticket']}  →  {item['error']}" for item in invalid_items]
                 self.validation_error_text.setPlainText(
@@ -5587,7 +5481,7 @@ class MainWindow(QMainWindow):
             self.download_excel_btn.setEnabled(False)
             self.download_txt_btn.setEnabled(False)
             self.scrape_links_btn.setEnabled(False)
-            # Show all errors in the card panel
+
             error_lines = [f"  {item['ticket']}  →  {item['error']}" for item in self.generated_items]
             self.validation_error_text.setPlainText(
                 f"All {total} ticket(s) failed validation:\n" +
@@ -5595,7 +5489,7 @@ class MainWindow(QMainWindow):
             )
             self.validation_error_panel.setVisible(True)
 
-        # Render results
+
         self.render_link_results()
 
     def download_generated_links_excel(self):
@@ -5605,26 +5499,26 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # Create DataFrame with ticket numbers and links
+
             valid_items = [item for item in self.generated_items if item['valid']]
             tickets = [item['ticket'] for item in valid_items]
             links = [item['link'] for item in valid_items]
-            
+
             df = pd.DataFrame({
                 'Ticket Number': tickets,
                 'Link': links
             })
 
-            # Save to Excel
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"generated_links_{timestamp}.xlsx"
             df.to_excel(filename, index=False)
 
             self.log(f"✅ Downloaded {len(self.generated_links)} links to {filename}")
-            QMessageBox.information(self, "Download Complete", 
+            QMessageBox.information(self, "Download Complete",
                                  f"Successfully saved {len(self.generated_links)} links to:\n{filename}")
 
-            # Open the file
+
             os.startfile(os.path.abspath(filename))
 
         except Exception as e:
@@ -5640,18 +5534,18 @@ class MainWindow(QMainWindow):
         try:
             valid_items = [item for item in self.generated_items if item['valid']]
             lines = [f"{item['ticket']}\t{item['link']}" for item in valid_items]
-            
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"generated_links_{timestamp}.txt"
-            
+
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines))
 
             self.log(f"✅ Downloaded {len(self.generated_links)} links to {filename}")
-            QMessageBox.information(self, "Download Complete", 
+            QMessageBox.information(self, "Download Complete",
                                  f"Successfully saved {len(self.generated_links)} links to:\n{filename}")
 
-            # Open the file
+
             os.startfile(os.path.abspath(filename))
 
         except Exception as e:
@@ -5669,7 +5563,7 @@ class MainWindow(QMainWindow):
             temp_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_generated_links.xlsx")
             df.to_excel(temp_file, index=False)
 
-            self.selected_file_path = temp_file          # absolute path
+            self.selected_file_path = temp_file
             self.file_label.setText(f"✔  Generated Links  ({len(self.generated_links)} tickets)")
             self.file_label.setStyleSheet("""
                 QLabel {
@@ -5709,53 +5603,53 @@ class MainWindow(QMainWindow):
         self.search_input.clear()
         self.validation_error_panel.setVisible(False)
         self.validation_error_text.clear()
-        
-        # Clear results list
+
+
         for i in reversed(range(self.link_results_layout.count())):
-            if i < self.link_results_layout.count() - 1:  # Keep the stretch
+            if i < self.link_results_layout.count() - 1:
                 item = self.link_results_layout.itemAt(i)
                 if item.widget():
                     item.widget().deleteLater()
-        
+
         self.log("🗑️ Cleared ticket input")
 
     def upload_ticket_file(self):
         """Upload Excel/CSV file with ticket numbers and convert to links"""
         file_name, _ = QFileDialog.getOpenFileName(
-            self, 
-            "Select Excel/CSV File", 
-            "", 
+            self,
+            "Select Excel/CSV File",
+            "",
             "Excel Files (*.xlsx *.xls);;CSV Files (*.csv);;All Files (*)"
         )
-        
+
         if file_name:
             try:
                 self.log(f"Reading file: {file_name}")
-                
+
                 if file_name.endswith('.csv'):
                     df = pd.read_csv(file_name)
                 else:
                     df = pd.read_excel(file_name)
-                
-                # Look for ticket numbers in any column
+
+
                 all_tickets = []
                 for col in df.columns:
                     for value in df[col].dropna().astype(str):
                         tickets = parse_tickets(str(value))
                         all_tickets.extend(tickets)
-                
+
                 if not all_tickets:
                     QMessageBox.warning(self, "No Tickets", "No ticket numbers found in the file!")
                     return
-                
-                # Remove duplicates
+
+
                 unique_tickets = list(dict.fromkeys(all_tickets))
-                
-                # Convert to links with validation
+
+
                 converted_links = []
                 valid_tickets = []
                 invalid_tickets = []
-                
+
                 for ticket in unique_tickets:
                     valid, error_msg = is_valid_ticket(ticket)
                     if valid:
@@ -5764,9 +5658,9 @@ class MainWindow(QMainWindow):
                         valid_tickets.append(ticket)
                     else:
                         invalid_tickets.append((ticket, error_msg))
-                
+
                 if not converted_links:
-                    # Show all errors in the card panel instead of a popup
+
                     error_lines = [f"  {t}  →  {e}" for t, e in invalid_tickets]
                     self.validation_error_text.setPlainText(
                         f"All {len(invalid_tickets)} ticket(s) failed validation:\n" +
@@ -5776,7 +5670,7 @@ class MainWindow(QMainWindow):
                     self.log(f"⚠️ All {len(invalid_tickets)} tickets from file failed validation — see Link Generator card for details")
                     return
 
-                # Show invalid tickets in the card panel (not the log)
+
                 if invalid_tickets:
                     error_lines = [f"  {t}  →  {e}" for t, e in invalid_tickets]
                     self.validation_error_text.setPlainText(
@@ -5788,8 +5682,8 @@ class MainWindow(QMainWindow):
                 else:
                     self.validation_error_panel.setVisible(False)
                     self.validation_error_text.clear()
-                
-                # Create DataFrame in ITMIS_Ticket_Links format
+
+
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
                 output_filename = os.path.join(
                     os.path.dirname(os.path.abspath(file_name)),
@@ -5806,7 +5700,7 @@ class MainWindow(QMainWindow):
                 self.log(f"✅ Converted {len(converted_links)} tickets to links")
                 self.log(f"✅ Saved converted file: {output_filename}")
 
-                # Show dialog with 2 options
+
                 msg = QMessageBox(self)
                 msg.setWindowTitle("File Converted")
                 msg.setText(f"Successfully converted {len(converted_links)} ticket numbers to links!\n\n"
@@ -5827,7 +5721,7 @@ class MainWindow(QMainWindow):
                     os.startfile(output_filename)
                     self.log(f"📥 Downloaded {os.path.basename(output_filename)}")
                 elif msg.clickedButton() == scrape_btn:
-                    self.selected_file_path = output_filename   # absolute path
+                    self.selected_file_path = output_filename
                     self.file_label.setText(f"✔  {os.path.basename(output_filename)}  ({len(converted_links)} tickets)")
                     self.file_label.setStyleSheet("""
                         QLabel {
@@ -5847,7 +5741,7 @@ class MainWindow(QMainWindow):
                     """)
                     self.start_button.setEnabled(True)
                     self.log(f"▶ Ready to scrape {len(converted_links)} tickets")
-                
+
             except Exception as e:
                 self.log(f"❌ Error processing file: {str(e)}")
                 QMessageBox.critical(self, "File Error", f"Failed to process file:\n{str(e)}")
@@ -5868,16 +5762,16 @@ class MainWindow(QMainWindow):
 
     def render_link_results(self):
         """Render the generated links in the scrollable results list"""
-        # Clear existing results (except stretch)
+
         for i in reversed(range(self.link_results_layout.count())):
             if i < self.link_results_layout.count() - 1:
                 item = self.link_results_layout.itemAt(i)
                 if item.widget():
                     item.widget().deleteLater()
-        
-        # Filter items based on current filter mode and search
+
+
         filtered_items = self.get_filtered_items()
-        
+
         if not filtered_items:
             empty_label = QLabel("No results to display")
             empty_label.setStyleSheet("""
@@ -5893,8 +5787,8 @@ class MainWindow(QMainWindow):
             empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.link_results_layout.insertWidget(0, empty_label)
             return
-        
-        # Add each item
+
+
         for idx, item in enumerate(filtered_items):
             item_widget = self.create_link_item_widget(item, idx)
             self.link_results_layout.insertWidget(idx, item_widget)
@@ -5914,12 +5808,12 @@ class MainWindow(QMainWindow):
                 padding: 6px;
             }
         """)
-        
+
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(8)
-        
-        # Index
+
+
         index_label = QLabel(f"{idx + 1}")
         index_label.setStyleSheet("""
             QLabel {
@@ -5939,8 +5833,8 @@ class MainWindow(QMainWindow):
         """)
         index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(index_label)
-        
-        # Ticket number
+
+
         ticket_label = QLabel(item['ticket'])
         ticket_label.setStyleSheet("""
             QLabel {
@@ -5952,8 +5846,8 @@ class MainWindow(QMainWindow):
         """)
         ticket_label.setToolTip(item.get('error', '') if not item['valid'] else '')
         layout.addWidget(ticket_label, 1)
-        
-        # Link (if valid)
+
+
         if item['valid']:
             link_label = QLabel(item['link'])
             link_label.setWordWrap(True)
@@ -5966,8 +5860,8 @@ class MainWindow(QMainWindow):
                 }
             """)
             layout.addWidget(link_label, 2)
-            
-            # Copy button
+
+
             copy_btn = QPushButton("📋")
             copy_btn.setToolTip("Copy link")
             copy_btn.setFixedSize(24, 24)
@@ -5993,9 +5887,9 @@ class MainWindow(QMainWindow):
             """)
             copy_btn.clicked.connect(lambda: self.copy_to_clipboard(item['link']))
             layout.addWidget(copy_btn)
-            
-            # Open button
-            # Show error message for invalid tickets
+
+
+
             error_label = QLabel(item.get('error', 'Invalid format'))
             error_label.setStyleSheet("""
                 QLabel {
@@ -6008,8 +5902,8 @@ class MainWindow(QMainWindow):
             """)
             error_label.setToolTip(item.get('error', 'Invalid format'))
             layout.addWidget(error_label, 2)
-        
-        # Validity badge
+
+
         badge = QLabel("✓" if item['valid'] else "✗")
         _badge_rgb = "0, 166, 81" if item['valid'] else "211, 47, 47"
         _badge_color = "#007A3B" if item['valid'] else "#D32F2F"
@@ -6027,38 +5921,38 @@ class MainWindow(QMainWindow):
         """)
         badge.setToolTip(item.get('error', '') if not item['valid'] else 'Valid ticket')
         layout.addWidget(badge)
-        
+
         return widget
 
     def get_filtered_items(self):
         """Get items filtered by search query and filter mode"""
         items = self.generated_items
-        
-        # Apply filter mode
+
+
         if self.filter_mode == 'valid':
             items = [item for item in items if item['valid']]
         elif self.filter_mode == 'invalid':
             items = [item for item in items if not item['valid']]
-        
-        # Apply search query
+
+
         search_query = self.search_input.text().lower().strip()
         if search_query:
-            items = [item for item in items if 
-                     search_query in item['ticket'].lower() or 
+            items = [item for item in items if
+                     search_query in item['ticket'].lower() or
                      (item['link'] and search_query in item['link'].lower())]
-        
+
         return items
 
     def set_filter_mode(self, mode):
         """Set the filter mode and update UI"""
         self.filter_mode = mode
-        
-        # Update button states
+
+
         self.filter_valid_btn.setChecked(mode == 'valid')
         self.filter_invalid_btn.setChecked(mode == 'invalid')
         self.filter_all_btn.setChecked(mode == 'all')
-        
-        # Re-render results
+
+
         self.render_link_results()
 
     def filter_link_results(self):
@@ -6114,7 +6008,7 @@ class MainWindow(QMainWindow):
             self.log(f"Validating file: {file_name}")
             df = pd.read_excel(file_name)
 
-            # ── Step 1: locate the ticket/link column ──────────────
+
             if 'Link' in df.columns:
                 raw_values = df['Link'].dropna().astype(str).tolist()
                 source_col = 'Link'
@@ -6135,7 +6029,7 @@ class MainWindow(QMainWindow):
                         f"Available columns: {available_cols}"
                     )
 
-            # ── Step 2: parse & validate every entry ───────────────
+
             all_tokens = []
             for value in raw_values:
                 all_tokens.extend(parse_tickets(str(value)))
@@ -6147,11 +6041,11 @@ class MainWindow(QMainWindow):
             valid_tickets, invalid_tickets = [], []
 
             for token in unique_tokens:
-                # Already a full URL — accept as-is
+
                 if token.startswith('http'):
                     valid_tickets.append(('__url__', token))
                     continue
-                # Bare ticket number or the last segment of a URL
+
                 candidate = token.split('/')[-1] if '/' in token else token
                 ok, err = is_valid_ticket(candidate)
                 if ok:
@@ -6159,7 +6053,7 @@ class MainWindow(QMainWindow):
                 else:
                     invalid_tickets.append((token, err))
 
-            # ── Step 3: show results in Link Generator card ────────
+
             total = len(unique_tokens)
             valid_count = len(valid_tickets)
             invalid_count = len(invalid_tickets)
@@ -6168,7 +6062,7 @@ class MainWindow(QMainWindow):
             self.stat_valid.setText(str(valid_count))
             self.stat_invalid.setText(str(invalid_count))
 
-            # Build generated_items so render_link_results works
+
             self.generated_items = []
             self.generated_links = []
             for ticket, link in valid_tickets:
@@ -6180,7 +6074,7 @@ class MainWindow(QMainWindow):
 
             self.render_link_results()
 
-            # Validation error panel
+
             if invalid_tickets:
                 error_lines = [f"  {t}  →  {e}" for t, e in invalid_tickets]
                 self.validation_error_text.setPlainText(
@@ -6196,13 +6090,13 @@ class MainWindow(QMainWindow):
             if valid_count == 0:
                 raise ValueError("No valid ticket numbers or URLs found in the file")
 
-            # ── Step 4: save converted file with absolute path ─────
+
             ticket_list = [t for t, _ in valid_tickets if t != '__url__']
             url_list    = [lnk for _, lnk in valid_tickets]
 
             timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
             converted_filename = f"ITMIS_Ticket_Links_{timestamp}.xlsx"
-            # Always save next to the original file so we know the directory exists
+
             converted_file = os.path.join(os.path.dirname(os.path.abspath(file_name)), converted_filename)
 
             out_df = pd.DataFrame({'Ticket Number': ticket_list if ticket_list else url_list, 'Link': url_list})
@@ -6210,8 +6104,8 @@ class MainWindow(QMainWindow):
             self.log(f"✅ Converted {valid_count} tickets to links")
             self.log(f"✅ Saved converted file: {converted_file}")
 
-            # ── Step 5: wire up for scraping ───────────────────────
-            self.selected_file_path = converted_file          # absolute path
+
+            self.selected_file_path = converted_file
             self.config.LAST_FILE_PATH = converted_file
             self.config.save_settings()
 
@@ -6231,7 +6125,7 @@ class MainWindow(QMainWindow):
             """)
             self.file_name_label.setText(os.path.basename(file_name))
 
-            # Enable download/scrape buttons in Link Generator card
+
             self.download_excel_btn.setEnabled(True)
             self.download_txt_btn.setEnabled(True)
             self.scrape_links_btn.setEnabled(True)
@@ -6263,8 +6157,8 @@ class MainWindow(QMainWindow):
         if not self.selected_file_path:
             QMessageBox.warning(self, "No File Selected", "Please select an Excel file first!")
             return
-        
-        # Update UI state
+
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.file_button.setEnabled(False)
@@ -6285,12 +6179,12 @@ class MainWindow(QMainWindow):
                 letter-spacing: 0.4px;
             }
         """)
-        
-        # Clear previous logs and stats
+
+
         self.log_area.clear()
         self.stats_label.setText("PROCESSING IN PROGRESS...")
-        
-        # Create and start scraper thread
+
+
         self.scraper_thread = ScraperThread(self.selected_file_path, self.config)
         self.scraper_thread.progress.connect(self.update_progress)
         self.scraper_thread.log.connect(self.log)
@@ -6298,7 +6192,7 @@ class MainWindow(QMainWindow):
         self.scraper_thread.error.connect(self.scraping_error)
         self.scraper_thread.validation_errors.connect(self.show_scraper_validation_errors)
         self.scraper_thread.start()
-        
+
         self.log("─" * 60)
         self.log("STARTING ITMIS TICKET SCRAPING SESSION")
         self.log("─" * 60)
@@ -6307,12 +6201,12 @@ class MainWindow(QMainWindow):
         """Stop the scraping process"""
         if self.scraper_thread and self.scraper_thread.isRunning():
             reply = QMessageBox.question(
-                self, 
-                "Stop Scraping", 
+                self,
+                "Stop Scraping",
                 "Are you sure you want to stop the scraping process?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            
+
             if reply == QMessageBox.StandardButton.Yes:
                 self.log("■  User requested abort...")
                 self.status_label.setText("■  ABORTING...")
@@ -6330,7 +6224,7 @@ class MainWindow(QMainWindow):
                     }
                 """)
                 self.scraper_thread.stop()
-                self.scraper_thread.wait(5000)  # Wait up to 5 seconds
+                self.scraper_thread.wait(5000)
                 self.scraping_finished([])
 
     def update_progress(self, value):
@@ -6360,8 +6254,8 @@ class MainWindow(QMainWindow):
     def log(self, message):
         """Enhanced logging with timestamps and formatting"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        
-        # Color coding based on message content
+
+
         if "error" in message.lower() or "failed" in message.lower() or "critical" in message.lower():
             formatted_message = f'<span style="color: #D32F2F; font-weight: bold;">[{timestamp}]  {message}</span>'
         elif "success" in message.lower() or "completed" in message.lower() or "✅" in message:
@@ -6380,17 +6274,17 @@ class MainWindow(QMainWindow):
                 formatted_message = f'<span style="color: #3A2E26;">[{timestamp}]  {message}</span>'
         else:
             formatted_message = f'<span style="color: #3A2E26;">[{timestamp}]  {message}</span>'
-        
+
         self.log_area.append(formatted_message)
-        
-        # Auto-scroll to bottom
+
+
         cursor = self.log_area.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.log_area.setTextCursor(cursor)
 
     def scraping_finished(self, results):
         """Handle scraping completion"""
-        # Update UI state
+
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.file_button.setEnabled(True)
@@ -6410,21 +6304,21 @@ class MainWindow(QMainWindow):
                 letter-spacing: 0.4px;
             }
         """)
-        
-        # Update statistics
+
+
         if results:
             self.update_statistics(results)
             self.log("─" * 60)
             self.log("SCRAPING SESSION COMPLETED SUCCESSFULLY")
             self.log("─" * 60)
 
-            # Quick summary popup
+
             self.show_results_dashboard(results)
-            
-            # Enhanced completion dialog with Open button
+
+
             reply = QMessageBox.information(
-                self, 
-                "Scraping Complete", 
+                self,
+                "Scraping Complete",
                 f"Successfully processed {len(results)} tickets!\n\n"
                 f"Results have been saved to 'rechecked.xlsx'",
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Open
@@ -6450,11 +6344,11 @@ class MainWindow(QMainWindow):
 
         msg = f"""
         🎯 Scraping Summary
-        
+
         Total Tickets: {total}
         Tickets with Keywords: {with_keywords} ({keyword_pct:.1f}%)
         Success Rate: {success_pct:.1f}%
-        
+
         Files saved:
         • rechecked.xlsx (main results)
         • rechecked_backup_*.xlsx
@@ -6467,7 +6361,7 @@ class MainWindow(QMainWindow):
         try:
             output_file = os.path.abspath("rechecked.xlsx")
             if os.path.exists(output_file):
-                os.startfile(output_file)  # Windows
+                os.startfile(output_file)
                 self.log("✅ Opened rechecked.xlsx")
             else:
                 QMessageBox.warning(self, "File Not Found", "rechecked.xlsx not found.")
@@ -6491,13 +6385,13 @@ class MainWindow(QMainWindow):
             }
         """)
         self.log(f"CRITICAL ERROR: {error_message}")
-        
-        # Reset UI
+
+
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.file_button.setEnabled(True)
         self.config_button.setEnabled(True)
-        
+
         QMessageBox.critical(self, "Scraping Error", f"An error occurred during scraping:\n\n{error_message}")
 
     def show_scraper_validation_errors(self, invalid_entries):
@@ -6516,15 +6410,15 @@ class MainWindow(QMainWindow):
         """Update processing statistics with better formatting"""
         if not results:
             return
-        
+
         total = len(results)
         successful = len([r for r in results if r.get('Processing Status') == 'Success'])
         with_keywords = len([r for r in results if r.get('Contains Keywords', False)])
         failed = total - successful
-        
+
         success_rate = (successful / total * 100) if total > 0 else 0
         keyword_rate = (with_keywords / successful * 100) if successful > 0 else 0
-        
+
         stats_text = (
             f'<span style="color:#8B7355">TOTAL</span> <span style="color:#1C140F">{total}</span>'
             f'&nbsp;&nbsp;&nbsp;'
@@ -6536,7 +6430,7 @@ class MainWindow(QMainWindow):
             f'&nbsp;&nbsp;&nbsp;'
             f'<span style="color:#8B7355">KEYWORDS HIT</span> <span style="color:#1C140F">{with_keywords}  [{keyword_rate:.1f}%]</span>'
         )
-        
+
         self.stats_label.setText(stats_text)
         self.stats_label.setStyleSheet("""
             QLabel {
@@ -6555,16 +6449,16 @@ class MainWindow(QMainWindow):
         """Open configuration dialog"""
         if self.config_dialog is None:
             self.config_dialog = ConfigDialog(self.config)
-        
-        # Update config dialog with current values
+
+
         self.config_dialog.show()
         self.config_dialog.raise_()
         self.config_dialog.activateWindow()
-        
-        # Update preview when dialog is closed
+
+
         self.config_dialog.finished.connect(self.update_config_preview)
 
-    # ── Live Monitor ─────────────────────────────────────────────
+
 
     def init_live_monitor(self):
         """Wire live monitor signals and session restore."""
@@ -7008,7 +6902,7 @@ class MainWindow(QMainWindow):
             f'<span style="color:{colour};">{prefix} {message}</span>'
         )
         self.live_monitor_status_messages.append(html_line)
-        self.live_monitor_status_messages = self.live_monitor_status_messages[-100:]  # Increased from 20 to 100
+        self.live_monitor_status_messages = self.live_monitor_status_messages[-100:]
         self.lm_mini_log.setHtml("<br>".join(self.live_monitor_status_messages))
         sb = self.lm_mini_log.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -7180,7 +7074,7 @@ class MainWindow(QMainWindow):
         self._lm_set_monitoring_active(True)
         self._lm_append_status("Starting live monitor...")
 
-        # Initialize debug log file
+
         self._debug_log_file = None
         try:
             log_filename = f"debug_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
@@ -7206,8 +7100,8 @@ class MainWindow(QMainWindow):
             tid = t.get("ticket_id")
             url = t.get("ticket_url")
             if tid:
-                # Every restored ticket, including an old preliminary record, is
-                # considered pre-existing for this new monitoring session.
+
+
                 self.live_monitor_thread._processed_ids.add(tid)
                 self.live_monitor_thread._baseline_ticket_ids.add(tid)
             if url:
@@ -7232,8 +7126,8 @@ class MainWindow(QMainWindow):
         self._lm_set_monitoring_active(False)
         if self.live_monitor_tickets:
             self.export_live_monitor_excel(prompt=True)
-        
-        # Close debug log file
+
+
         if self._debug_log_file:
             try:
                 self._debug_log_file.write(f"\nDebug Log Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -7245,7 +7139,7 @@ class MainWindow(QMainWindow):
 
     def on_live_monitor_status(self, message):
         self._lm_append_status(message)
-        # Write to debug log file
+
         if self._debug_log_file:
             try:
                 timestamp = datetime.now().strftime('%H:%M:%S')
@@ -7269,21 +7163,21 @@ class MainWindow(QMainWindow):
 
     def on_live_monitor_ticket_captured(self, record):
         ticket_id = record.get("ticket_id", "")
-        
-        # Check if this is a preliminary record that needs to be replaced with full details
+
+
         existing_index = -1
         for i, t in enumerate(self.live_monitor_tickets):
             if t.get("ticket_id") == ticket_id:
                 existing_index = i
                 break
-        
+
         if existing_index >= 0:
-            # Replace preliminary record with full details
+
             old_record = self.live_monitor_tickets[existing_index]
             if old_record.get("preliminary"):
                 self.live_monitor_tickets[existing_index] = record
                 self._lm_append_status(f"Updated ticket {ticket_id} with full details")
-                # Update the card
+
                 self.add_live_monitor_card(record, is_new=False, is_duplicate=False)
                 self.lm_last_captured_label.setText(
                     f"Last captured: {datetime.now().strftime('%H:%M:%S')}"
@@ -7292,13 +7186,13 @@ class MainWindow(QMainWindow):
                 self.persist_live_monitor_session()
                 self._update_ticket_notification(record)
                 return
-        
-        # Check for duplicate (non-preliminary)
+
+
         if ticket_id in self.live_monitor_ticket_ids:
             self.on_live_monitor_duplicate(ticket_id)
             return
 
-        # New ticket
+
         self.live_monitor_tickets.append(record)
         self.live_monitor_ticket_ids.add(ticket_id)
         self.add_live_monitor_card(record, is_new=True, is_duplicate=False)
@@ -7330,9 +7224,9 @@ class MainWindow(QMainWindow):
     def add_live_monitor_card(self, record, is_new=True, is_duplicate=False):
         ticket_id = record.get("ticket_id", "")
 
-        # If a card for this ticket already exists (e.g. we're upgrading a preliminary
-        # dashboard/notification placeholder to the fully-extracted record), remove the
-        # old widget first so we don't end up with two cards for the same ticket.
+
+
+
         old_card = self.live_monitor_card_widgets.get(ticket_id)
         if old_card is not None:
             self.lm_feed_layout.removeWidget(old_card)
@@ -7542,7 +7436,7 @@ class MainWindow(QMainWindow):
             bar = self.lm_feed_scroll.verticalScrollBar()
             bar.setValue(bar.maximum())
         except RuntimeError:
-            # Window/feed may have been closed before the short delayed scroll fires.
+
             pass
 
     def _safe_widget_set_style(self, widget, stylesheet):
@@ -7559,8 +7453,8 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setStyleSheet(stylesheet)
         except RuntimeError:
-            # The widget was removed/replaced before the delayed UI reset fired.
-            # This is expected during preliminary -> full-detail card upgrades.
+
+
             pass
 
     def _safe_widget_set_text(self, widget, text):
@@ -7575,14 +7469,14 @@ class MainWindow(QMainWindow):
         self._safe_widget_set_style(
             card, _LM_CARD_DUPE_FLASH if duplicate else _LM_CARD_NEW_FLASH
         )
-        # Never call card.setStyleSheet directly from a delayed lambda: the
-        # preliminary card may have been replaced by the full-detail card first.
+
+
         QTimer.singleShot(1600, lambda c=card: self._safe_widget_set_style(c, _LM_CARD_DEFAULT))
 
     def _on_copy_clicked(self, btn, text):
         QApplication.clipboard().setText(text)
         self._safe_widget_set_text(btn, "✓  Copied")
-        # The ticket card (and this button) can be replaced while the timer waits.
+
         QTimer.singleShot(1500, lambda b=btn: self._safe_widget_set_text(b, "📋  Copy"))
 
     def _copy_all_tickets(self):
@@ -7752,7 +7646,7 @@ class MainWindow(QMainWindow):
                 "Scraping is in progress. Are you sure you want to exit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            
+
             if reply == QMessageBox.StandardButton.Yes:
                 self.scraper_thread.stop()
                 self.scraper_thread.wait(3000)
@@ -7768,14 +7662,11 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
-    # Set application properties
+
     app.setApplicationName("ITMIS Ticket Scraper")
     app.setApplicationVersion("2.0")
     app.setOrganizationName("TicketScraper")
-    
-    # Apply palette for native light widgets (dialogs, etc.)
-    # Transparent-friendly palette (no solid warm fills)
+
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor(255, 255, 255, 0))
     palette.setColor(QPalette.ColorRole.WindowText, QColor("#1C140F"))
@@ -7790,16 +7681,12 @@ if __name__ == "__main__":
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     app.setPalette(palette)
 
-    # Theme every QMessageBox (Save/Reset confirmations, warnings, errors,
-    # etc.) to match the app's glass UI, and give each one real acrylic
-    # blur-behind so it looks like part of the same frosted-glass surface
-    # as ConfigDialog rather than a plain native popup.
     app.setStyleSheet(GLASS_MESSAGEBOX_QSS)
-    app._glass_dialog_blur_filter = GlassDialogBlurFilter(app)  # keep a ref alive
+    app._glass_dialog_blur_filter = GlassDialogBlurFilter(app)
     app.installEventFilter(app._glass_dialog_blur_filter)
 
-    # Create and show main window
+
     window = MainWindow()
     window.show()
-    
+
     sys.exit(app.exec())
