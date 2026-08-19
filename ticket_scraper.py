@@ -2430,11 +2430,7 @@ class LiveMonitorThread(QThread):
     def _extract_api_details(self, body_text, ticket_number):
         """Best-effort details from the JSON object containing a ticket ID."""
         details = {
-            "assignee": "",
-            "station": "",
             "description": "PMA Issued a NEW Ticket - Click to view details",
-            "priority": "",
-            "date": "",
         }
         try:
             data = json.loads(str(body_text or ""))
@@ -2486,24 +2482,9 @@ class LiveMonitorThread(QThread):
                             return str(value).strip()
             return default
 
-        details["station"] = pick(
-            ["station", "stationname", "location", "locationname"],
-            details["station"],
-        )
         details["description"] = pick(
             ["description", "faultdescription", "complaint", "subject", "title"],
             details["description"],
-        )
-        details["priority"] = pick(
-            ["priority", "priorityname", "severity"], details["priority"]
-        )
-        details["assignee"] = pick(
-            ["assignee", "assignedto", "assignedtoname", "technician"],
-            details["assignee"],
-        )
-        details["date"] = pick(
-            ["createddate", "createdon", "createdat", "ticketdate", "datetime", "date"],
-            details["date"],
         )
         return details
 
